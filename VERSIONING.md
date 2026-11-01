@@ -12,12 +12,13 @@
 
 | 位置 | 用途 |
 |---|---|
-| `Cargo.toml` 的 `version` | 程序版本，`wgopt --version` 读取它 |
+| `Cargo.toml` 的 `version` | 程序版本，`wgopt --version` 读取它；安装包版本也读这里 |
 | `assets/wgopt.rc` 的 `FILEVERSION` / `PRODUCTVERSION` | exe 文件属性里显示的版本 |
 | `assets/wgopt.rc` 的 `FileVersion` / `ProductVersion` | 资源字符串 |
 
-三处由 `scripts/bump-version.ps1` 一次性同步，**不要手改**。
+前两组由 `scripts/bump-version.ps1` 一次性同步，**不要手改**。
 `wgopt.rc` 的改动要重新编译才生效。
+安装包版本由 `build-installer.cmd` 从 `Cargo.toml` 读取后传给 NSIS，不需要单独维护。
 
 ## 发布流程
 
@@ -31,21 +32,32 @@ release.cmd 1.0.1 "fix: 修复 xxx"
 2. `cargo test`
 3. `cargo build --release`
 4. 拷贝托盘图标到 `target\release\tray\`
-5. `git commit` + `git tag v1.0.1`
-6. `git push origin main` + `git push origin v1.0.1`
+5. `build-installer.cmd` 打 NSIS 安装包
+6. `git commit` + `git tag v1.0.1`
+7. `git push origin main` + `git push origin v1.0.1`
 
-需要带 exe 的 GitHub Release：
+产物：
+
+| 文件 | 说明 |
+|---|---|
+| `target\release\wgopt.exe` | 主程序 |
+| `target\release\bundle\WGOpt-Core-<版本>-x64-setup.exe` | 安装包（分发这个） |
+| `target\release\bundle\release-notes-<版本>.md` | Release 说明，自动生成 |
+
+需要发布到 GitHub Release：
 
 ```bat
 scripts\publish-release.cmd 1.0.1
 ```
 
-**分发时 exe 必须和 `tray\` 目录一起给。** 只有 exe 时托盘图标找不到，托盘不显示。
+**分发用安装包。** 安装包会把 exe 与 `tray\` 图标一起装好；
+只给裸 exe 时托盘图标找不到，托盘不显示。
 
 ## 版本历史
 
 | 版本 | 类型 | 内容 |
 |---|---|---|
+| 1.0.1 | feat | 新增 NSIS 安装包：用户级安装到 `%LOCALAPPDATA%\WGOpt Core`、开始菜单、控制面板条目、静默安装；修复残留注册表导致装到错误路径 |
 | 1.0.0 | feat | 首个版本：去掉 Tauri 界面，改为托盘常驻；托盘三态图标显示优化状态、托盘控制总开关与各项开关、配置文件控制、状态变化系统通知 |
 
 ## 与桌面版的关系

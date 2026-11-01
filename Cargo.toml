@@ -1,6 +1,6 @@
 [package]
 name = "wgopt-core"
-version = "1.0.0"
+version = "1.0.1"
 description = "WGOpt 核心：无界面、托盘常驻的游戏优化后台程序"
 authors = ["WGOpt"]
 edition = "2021"

@@ -1,40 +1,88 @@
 @echo off
-chcp 65001 >nul
+
 setlocal
+
 cd /d "%~dp0.."
 
+
+
+rem ASCII-only output on purpose: cmd under GBK code page mangles Chinese.
+
+
+
 if "%~1"=="" (
-  echo   用法: publish-release.cmd ^<版本号^>
+
+  echo   usage: publish-release.cmd ^<version^>
+
   exit /b 1
+
 )
+
+
 
 set "VER=%~1"
-set "EXE=target\release\wgopt.exe"
 
-if not exist "%EXE%" (
-  echo   [错误] 找不到 %EXE%，请先运行 release.cmd
+set "SETUP=target\release\bundle\WGOpt-Core-%VER%-x64-setup.exe"
+
+set "NOTES=target\release\bundle\release-notes-%VER%.md"
+
+
+
+if not exist "%SETUP%" (
+
+  echo   [ERROR] installer not found: %SETUP%
+
+  echo   run release.cmd %VER% first
+
   exit /b 1
+
 )
+
+
 
 where gh >nul 2>nul
-if errorlevel 1 (
-  echo   [错误] 未找到 gh CLI
-  exit /b 1
-)
-
-echo.
-echo   创建 GitHub Release v%VER%...
-echo.
-gh release create "v%VER%" "%EXE%" ^
-  --title "WGOpt Core v%VER%" ^
-  --notes "无界面游戏优化后台程序 v%VER%。下载 wgopt.exe 后与 tray 图标目录放在一起运行。" ^
-  --latest
 
 if errorlevel 1 (
-  echo   [错误] 创建 Release 失败
+
+  echo   [ERROR] gh CLI not found
+
   exit /b 1
+
 )
 
+
+
+if not exist "%NOTES%" (
+
+  echo   [ERROR] release notes not found: %NOTES%
+
+  exit /b 1
+
+)
+
+
+
 echo.
-echo   完成。注意：exe 需要与 tray\ 图标目录一起分发，否则托盘图标会回退到系统默认图标。
+
+echo   creating GitHub release v%VER%...
+
 echo.
+
+gh release create "v%VER%" "%SETUP%" --title "WGOpt Core v%VER%" --notes-file "%NOTES%" --latest
+
+if errorlevel 1 (
+
+  echo   [ERROR] release creation failed
+
+  exit /b 1
+
+)
+
+
+
+echo.
+
+echo   done.
+
+echo.
+

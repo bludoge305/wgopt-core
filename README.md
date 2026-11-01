@@ -95,23 +95,43 @@ wgopt --version
 
 日志在 `%APPDATA%\WGOpt\wgopt.log`，单文件上限 512 KB 自动滚动。
 
+## 安装
+
+下载 `WGOpt-Core-<版本>-x64-setup.exe` 双击安装。安装程序与原版 WGOpt 的行为一致：
+
+- **用户级安装**，不需要管理员权限，装到 `%LOCALAPPDATA%\WGOpt Core`
+- 开始菜单创建「WGOpt Core」与「卸载 WGOpt Core」
+- 控制面板「应用和功能」里可以看到并卸载
+- 静默安装：`WGOpt-Core-<版本>-x64-setup.exe /S`
+- 静默卸载：`"%LOCALAPPDATA%\WGOpt Core\uninstall.exe" /S`
+
+卸载会清除程序文件、开始菜单和注册表项，但**保留** `%APPDATA%\WGOpt` 下的配置与日志，
+重装后配置还在。
+
+也可以不安装，直接把 `wgopt.exe` 与 `tray\` 目录放在同一处运行。
+
 ## 构建
 
-需要 Rust（GNU 工具链）与 MinGW binutils：
-
-```bash
-cargo build --release
-```
-
-产物 `target/release/wgopt.exe`（约 820 KB）。
-
-**运行时需要 `target/release/tray/` 下的三个图标**（`idle.ico` / `active.ico` / `off.ico`），
-程序会在 exe 同目录的 `tray\`、`assets\tray\` 以及配置目录的 `icons\` 里依次查找。
-用 `deploy.cmd` 一次拷好：
+需要 Rust（GNU 工具链）、MinGW binutils，以及 NSIS。
 
 ```bat
-deploy.cmd
+deploy.cmd            :: 编译 exe 并部署托盘图标
+build-installer.cmd   :: 打安装包
 ```
+
+产物：
+
+| 文件 | 说明 |
+|---|---|
+| `target\release\wgopt.exe` | 主程序，约 820 KB |
+| `target\release\bundle\WGOpt-Core-<版本>-x64-setup.exe` | 安装包，约 740 KB |
+
+`build-installer.cmd` 会自动找 NSIS：先看 `NSIS_HOME`，再找 Tauri 缓存的
+`%LOCALAPPDATA%\tauri\NSIS\makensis.exe`（与原版安装包同源），最后找系统安装的 NSIS。
+
+**托盘图标是必需文件。** 程序会依次在 exe 同目录的 `tray\`、`assets\tray\`、
+`%APPDATA%\WGOpt\icons\` 里查找 `idle.ico` / `active.ico` / `off.ico`。
+安装包会自动把三个图标放到 `tray\` 下；手动部署时用 `deploy.cmd` 一次拷好。
 
 程序启动时会用 `runas` 自我提权（与原版一致），需要管理员权限才能停服务、结束其他用户的后台进程。
 
@@ -123,7 +143,12 @@ deploy.cmd
 release.cmd 1.0.1 "fix: 修复 xxx"
 ```
 
-脚本会同步版本号、编译、跑测试、提交、打 tag 并推送。
+脚本会同步版本号、跑测试、编译 exe、打安装包、提交、打 tag 并推送。
+需要把安装包挂到 GitHub Release：
+
+```bat
+scripts\publish-release.cmd 1.0.1
+```
 
 ## 许可
 

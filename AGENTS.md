@@ -76,16 +76,36 @@ manifests`。提权走运行时 `ShellExecuteExW(runas)`，与原版一致。
 ## 构建与运行
 
 ```bat
-deploy.cmd
+deploy.cmd            :: 编译 exe，把 assets\tray\*.ico 拷到 target\release\tray\
+build-installer.cmd   :: 用 NSIS 打安装包
 ```
-
-等价于 `cargo build --release` + 把 `assets\tray\*.ico` 拷到 `target\release\tray\`。
 
 **托盘图标是必需文件。** exe 单独拷走时图标会找不到，托盘不显示。程序会依次查找
 `<exe目录>\tray\`、`<exe目录>\assets\tray\`、`%APPDATA%\WGOpt\icons\`。
 
 编译前若 `wgopt.exe` 正在运行，链接会因文件占用失败（`os error 5`）。**它是以管理员
 身份跑的，普通权限杀不掉**，需要提权停进程。
+
+## 安装包
+
+`installer\installer.nsi` + `build-installer.cmd`，行为对齐原版 Tauri NSIS 包：
+
+- 用户级安装（`RequestExecutionLevel user`），装到 `%LOCALAPPDATA%\WGOpt Core`
+- 开始菜单快捷方式、控制面板条目、静默安装 `/S`
+- 卸载保留 `%APPDATA%\WGOpt` 的配置与日志
+
+三个坑：
+
+1. **`.nsi` 必须存成 UTF-8 with BOM**，否则 NSIS 按 ACP 解析，中文全是
+   `Bad text encoding` 报错。
+2. **`.cmd` 只写 ASCII 输出。** `chcp 65001` 在 GBK 环境下会把中文 echo 成乱码，
+   报错信息也一起坏掉，排查时反而更费劲。
+3. **NSIS 不读环境变量。** 参数必须用 `/D` 从命令行传，不能 `set` 了指望 `!define`
+   能读到。
+
+安装/卸载都不做强杀进程：常驻进程始终以管理员身份运行，普通权限的安装程序杀不掉；
+`taskkill /IM wgopt.exe` 还会误伤同名的桌面版 WGOpt。改用「以追加方式打开 exe」检测
+文件占用，被占用时提示用户从托盘退出后重试。
 
 ## 验证方式
 

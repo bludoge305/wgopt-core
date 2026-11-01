@@ -1,30 +1,31 @@
 @echo off
-chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
+
+rem ASCII-only output: cmd under GBK code page mangles Chinese.
 
 set "PATH=%~dp0.toolchain\mingw64\bin;%USERPROFILE%\.cargo\bin;%PATH%"
 
 echo.
-echo   === 编译 wgopt.exe ===
+echo   === build wgopt.exe ===
 echo.
 cargo build --release
 if errorlevel 1 (
-  echo   [错误] 编译失败
+  echo   [ERROR] build failed
   exit /b 1
 )
 
 echo.
-echo   === 部署托盘图标 ===
+echo   === deploy tray icons ===
 if not exist "target\release\tray" mkdir "target\release\tray"
 copy /y "assets\tray\*.ico" "target\release\tray\" >nul
 if errorlevel 1 (
-  echo   [错误] 复制图标失败
+  echo   [ERROR] failed to copy icons
   exit /b 1
 )
 dir /b "target\release\tray"
 
 echo.
-echo   完成：target\release\wgopt.exe
-echo   运行：target\release\wgopt.exe
+echo   binary   : target\release\wgopt.exe
+echo   installer: build-installer.cmd
 echo.
