@@ -395,6 +395,83 @@ pub fn current_pid() -> u32 {
     unsafe { GetCurrentProcessId() }
 }
 
+/// 取进程可执行文件完整路径，取不到时返回空串。
+///
+/// 重启被关闭的进程（如 Wallpaper Engine）需要原路径；
+/// 受保护进程拒绝 `PROCESS_QUERY_LIMITED_INFORMATION` 时返回空。
+pub fn process_image_path(pid: u32) -> String {
+    use windows::Win32::System::Threading::{QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
+
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return String::new();
+        };
+        let mut buf = vec![0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(handle);
+        if ok && len > 0 {
+            from_wide(&buf[..len as usize])
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// 按路径启动进程，返回新进程 PID（不等待其就绪）。
+pub fn spawn_process(exe_path: &str) -> Result<u32, String> {
+    use windows::Win32::System::Threading::{
+        CreateProcessW, CREATE_NEW_PROCESS_GROUP, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    if exe_path.is_empty() {
+        return Err("可执行文件路径为空".into());
+    }
+    if !std::path::Path::new(exe_path).exists() {
+        return Err(format!("找不到可执行文件：{exe_path}"));
+    }
+
+    let app = wide(exe_path);
+    // 工作目录设为程序所在目录：有些程序依赖相对路径读自己的资源
+    let workdir = std::path::Path::new(exe_path)
+        .parent()
+        .map(|p| wide(&p.to_string_lossy()))
+        .unwrap_or_else(|| wide(""));
+
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut info = PROCESS_INFORMATION::default();
+
+    unsafe {
+        CreateProcessW(
+            PCWSTR(app.as_ptr()),
+            None,
+            None,
+            None,
+            false,
+            CREATE_NEW_PROCESS_GROUP,
+            None,
+            PCWSTR(workdir.as_ptr()),
+            &startup,
+            &mut info,
+        )
+        .map_err(|e| format!("启动 {exe_path} 失败（错误码 {}）", e.code().0))?;
+
+        let pid = info.dwProcessId;
+        let _ = CloseHandle(info.hProcess);
+        let _ = CloseHandle(info.hThread);
+        Ok(pid)
+    }
+}
+
 // ---------------------------------------------------------------- 内存
 
 /// 整理所有可访问进程的工作集，返回 (释放字节数, 成功数, 失败数)。

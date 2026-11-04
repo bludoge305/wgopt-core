@@ -38,7 +38,7 @@ pub fn item_definitions() -> Vec<OptimizeItem> {
             id: "wallpaper".into(),
             label: "关闭 Wallpaper Engine".into(),
             needs_admin: false,
-            reversible: false,
+            reversible: true,
         },
         OptimizeItem {
             id: "xbox".into(),

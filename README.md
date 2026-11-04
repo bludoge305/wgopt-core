@@ -63,13 +63,16 @@
 | `priority` | 游戏进程提到「高」，白名单后台进程降到「低于正常」 | 否 | 是 |
 | `background` | 结束白名单内的后台进程 | 是 | 否 |
 | `memory` | 整理所有进程工作集（EmptyWorkingSet） | 否 | 否 |
-| `wallpaper` | 关闭 Wallpaper Engine | 否 | 否 |
+| `wallpaper` | 关闭 Wallpaper Engine | 否 | 是 |
 | `xbox` | 停止 XblAuthManager 服务 | 是 | 是 |
 | `search` | 停止 WSearch 服务 | 是 | 是 |
 | `dns` | 刷新 DNS 解析缓存 | 否 | 否 |
 | `clipboard` | 清空剪贴板 | 否 | 否 |
 
 进程终止只允许命中 `BACKGROUND_WHITELIST`，另有 `PROTECTED_PROCESSES` 硬性排除；服务操作只允许 `SERVICE_WHITELIST` 内的两个。可还原项在执行前记录原状态，停止优化或游戏退出时还原。
+
+`wallpaper` 在结束进程**之前**先记下它的可执行文件路径，还原时按该路径重新启动；
+若用户已经自己把 Wallpaper Engine 开回来了，则不会启动第二份。
 
 ## 游戏识别
 

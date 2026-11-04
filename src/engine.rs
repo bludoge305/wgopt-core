@@ -167,7 +167,11 @@ pub fn optimize_memory() -> ItemResult {
 }
 
 /// 4. 关闭 Wallpaper Engine（独立项，不属于通用后台白名单）。
-pub fn optimize_wallpaper() -> ItemResult {
+///
+/// 关闭前记录每个进程的可执行文件路径，停止优化时按此重新拉起。
+/// 只要原程序能取到路径就视为可还原——Wallpaper Engine 是用户主动
+/// 开着才有桌面壁纸的，关掉不还原等于把用户的桌面弄没了。
+pub fn optimize_wallpaper(snapshot: &mut Snapshot) -> ItemResult {
     let started = std::time::Instant::now();
     let targets = [
         "wallpaper32.exe",
@@ -179,11 +183,22 @@ pub fn optimize_wallpaper() -> ItemResult {
     let mut killed = Vec::new();
 
     for p in winapi::list_processes() {
-        if targets.iter().any(|t| t.eq_ignore_ascii_case(&p.name)) {
-            if winapi::terminate_process(p.pid).is_ok() {
-                if !killed.iter().any(|k: &String| k.eq_ignore_ascii_case(&p.name)) {
-                    killed.push(p.name.clone());
-                }
+        if !targets.iter().any(|t| t.eq_ignore_ascii_case(&p.name)) {
+            continue;
+        }
+        // 先取路径再结束：进程没了就查不到路径，还原时无从启动
+        let path = winapi::process_image_path(p.pid);
+        if winapi::terminate_process(p.pid).is_ok() {
+            if !killed.iter().any(|k: &String| k.eq_ignore_ascii_case(&p.name)) {
+                killed.push(p.name.clone());
+            }
+            if !path.is_empty()
+                && !snapshot
+                    .killed_programs
+                    .iter()
+                    .any(|q| q.eq_ignore_ascii_case(&path))
+            {
+                snapshot.killed_programs.push(path);
             }
         }
     }
@@ -299,7 +314,7 @@ pub fn run_item(id: &str, game: Option<&str>, snapshot: &mut Snapshot) -> ItemRe
         "priority" => optimize_priority(game, snapshot),
         "background" => optimize_background(game),
         "memory" => optimize_memory(),
-        "wallpaper" => optimize_wallpaper(),
+        "wallpaper" => optimize_wallpaper(snapshot),
         "xbox" => optimize_service("xbox", "XblAuthManager", "Xbox Live 身份验证管理器", snapshot),
         "search" => optimize_service("search", "WSearch", "Windows Search", snapshot),
         "dns" => optimize_dns(),
@@ -338,6 +353,28 @@ pub fn restore(snapshot: &Snapshot) -> Vec<String> {
         match winapi::start_service(service) {
             Ok(_) => messages.push(format!("已恢复服务 {service}")),
             Err(e) => messages.push(format!("恢复服务 {service} 失败：{e}")),
+        }
+    }
+
+    // 重新拉起被关闭的程序（Wallpaper Engine）。
+    // 用户可能已经自己手动开回来了，这种情况不重复启动。
+    for path in &snapshot.killed_programs {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+
+        if winapi::list_processes_basic()
+            .iter()
+            .any(|(_, running)| running.eq_ignore_ascii_case(&name))
+        {
+            messages.push(format!("{name} 已在运行，无需重启"));
+            continue;
+        }
+
+        match winapi::spawn_process(path) {
+            Ok(_) => messages.push(format!("已重新启动 {name}")),
+            Err(e) => messages.push(format!("重新启动 {name} 失败：{e}")),
         }
     }
 

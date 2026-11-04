@@ -117,6 +117,16 @@ wgopt --detect          :: 一轮游戏识别 + 判定依据
 wgopt --optimize-once   :: 真跑一遍 8 项，看每项 detail 与耗时
 ```
 
+可还原项的往返验证（快照只存在于运行的进程里，`--optimize-once` 与 `--restore`
+是两个进程，验证不了还原）。用 examples 走托盘同一对函数：
+
+```bat
+cargo run --release --example wallpaper_roundtrip     :: 关闭 WE → 还原重启 WE
+cargo run --release --example wallpaper_restore_edges :: 重复启动、路径失效、空快照
+```
+
+两个例子都需要管理员权限（要终止/启动进程）。
+
 托盘验证（Win11 新图标默认在溢出区，需点开"显示隐藏的图标"）：
 
 ```powershell
