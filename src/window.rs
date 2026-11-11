@@ -16,7 +16,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW, PostQuitMessage,
     RegisterClassW, SetTimer, TranslateMessage, HMENU, HWND_MESSAGE, MSG, WINDOW_EX_STYLE,
-    WM_APP, WM_CLOSE, WM_DESTROY, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use crate::logging;
@@ -47,6 +47,8 @@ pub struct Callbacks {
     pub show_menu: Box<dyn FnMut()>,
     /// Explorer 重启后重新注册托盘
     pub reattach: Box<dyn FnMut()>,
+    /// 全局快捷键按下（「立即开始优化」）
+    pub hotkey: Box<dyn FnMut()>,
 }
 
 /// 回调全局槽位。
@@ -71,6 +73,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if mouse == 0x0202 || mouse == 0x0205 {
                     if let Some(cb) = &mut *std::ptr::addr_of_mut!(CALLBACKS) {
                         (cb.show_menu)();
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_HOTKEY => {
+                // 只认自己注册的那个 id，别把别人的热键当成本程序的
+                if wparam.0 as i32 == crate::hotkey::HOTKEY_ID {
+                    if let Some(cb) = &mut *std::ptr::addr_of_mut!(CALLBACKS) {
+                        (cb.hotkey)();
                     }
                 }
                 LRESULT(0)

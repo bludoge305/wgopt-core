@@ -28,6 +28,7 @@ src/
   game_detect.rs     游戏识别（GPU 主判据 + 多维加权）
   config.rs          配置读写、开机自启
   app.rs             后台守护：状态机、3s 轮询、自动优化/还原
+  hotkey.rs          全局快捷键（RegisterHotKey）与编辑场景判定
   tray.rs            托盘图标、右键菜单、气泡通知
   window.rs          不可见消息窗口（HWND_MESSAGE）与消息循环
   single_instance.rs 命名互斥体 + 事件
@@ -55,6 +56,17 @@ manifests`。提权走运行时 `ShellExecuteExW(runas)`，与原版一致。
 
 **优化项、白名单、阈值不要随手调。** `THRESHOLD = 60`、`BACKGROUND_WHITELIST`、
 `PROTECTED_PROCESSES`、`SERVICE_WHITELIST` 都是原版实测过的值。
+
+**快捷键必须带修饰键。** `hotkey::Hotkey::parse` 拒绝裸键（`F2`、`A`）——注册成
+全局热键会吞掉正常输入。注册时始终附带 `MOD_NOREPEAT`，连按另由
+`TriggerGate`（1 秒）兜底，两道闸缺一不可。
+
+**快捷键与托盘菜单共用 `Shared::can_start`。** 别在快捷键路径上另写一份可用性
+判断，否则会出现「菜单灰了但按快捷键还能跑」的不一致。
+
+**编辑场景判定不要加浏览器类名黑名单。** 网页游戏的前台窗口就是
+`Chrome_RenderWidgetHostHWND` 这类通用窗口类，加进去会让网页游戏里按不了
+快捷键。这类场景靠 `hwndCaret` 判断即可。
 
 ## Shell：必须用 PowerShell 7
 
@@ -126,6 +138,17 @@ cargo run --release --example wallpaper_restore_edges :: 重复启动、路径�
 ```
 
 两个例子都需要管理员权限（要终止/启动进程）。
+
+快捷键验证（都不改配置、能直接跑）：
+
+```bat
+cargo run --example hotkey_probe                     :: 注册/重复注册被拒/真按一次/注销
+cargo run --example hotkey_edit_gate                 :: Edit 控件内忽略，普通窗口放行
+cargo run --release --example hotkey_trigger         :: 走出货代码，跑一轮 dns 项
+```
+
+`hotkey_probe` 与 `hotkey_trigger` 都用 `SendInput` 真的按 Ctrl+F2，跑之前先确认
+没有别的程序占着这个组合键（占着会直接报占用失败）。
 
 托盘验证（Win11 新图标默认在溢出区，需点开"显示隐藏的图标"）：
 

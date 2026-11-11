@@ -21,9 +21,26 @@
 - 顶部一行显示当前状态与已完成项数（如 `状态：已优化 7/8 · 黑神话：悟空`）
 - `启用优化总开关` —— 关闭后立刻还原已做的改动，并停止一切检测
 - `游戏运行时自动优化` —— 同时是后台游戏检测的开关：关闭后立即停用检测（不再轮询、不再采样 CPU/GPU、不再识别），重新开启时恢复
-- `立即开始优化` / `停止优化并还原`
+- `立即开始优化` / `停止优化并还原` —— 前者的右侧显示当前快捷键
+- `启用快捷键（Ctrl+F2）` —— 全局快捷键开关，勾选后立即注册/注销
 - 8 个优化项逐项勾选（等价于改配置文件，会立即写回）
 - `开机自启`、`打开配置文件目录`、`退出 WGOpt`
+
+**全局快捷键**默认 `Ctrl+F2`，按下等同于点「立即开始优化」：
+
+- 只在「立即开始优化」可用时触发（总开关开着、当前不是优化中/已优化），
+  判定与菜单灰化条件完全一致；不可用时只写日志，不弹通知打断游戏
+- 输入场景不误触：前台有文本光标、焦点在 `Edit` / `RichEdit` / `Scintilla`
+  一类编辑控件、或正在操作菜单时直接忽略
+- 按住不放只触发一次（注册时带 `MOD_NOREPEAT`）；连按另有 1 秒闸门，
+  防止后台还没切到「优化中」时排队出两轮
+- 组合键被别的程序占用时，托盘开关自动回到关闭并弹一条提醒
+
+按键写法：`Ctrl` / `Alt` / `Shift` / `Win` 用 `+` 与主键相连，例如
+`Ctrl+F2`、`Alt+Shift+F9`、`Ctrl+Space`。必须带至少一个修饰键——裸键注册成
+全局热键会把正常输入吞掉。主键可用 `A`–`Z`、`0`–`9`、`F1`–`F24`、
+`Space` `Tab` `Enter` `Esc` `Ins` `Del` `Home` `End` `PgUp` `PgDn`
+`Up` `Down` `Left` `Right`，以及 `` ` `` `-` `=` `[` `]` `\` `;` `'` `,` `.` `/`。
 
 **配置文件**控制单次启动时的初始状态，路径 `%APPDATA%\WGOpt\config.json`
 （与原版 Tauri 版的 `app_config_dir` 同一目录，从桌面版切过来不会丢配置）：
@@ -36,7 +53,9 @@
   "autostart": false,
   "notify_on_start": true,
   "notify_on_stop": true,
-  "restore_on_exit": true
+  "restore_on_exit": true,
+  "hotkey_enabled": true,
+  "hotkey": "Ctrl+F2"
 }
 ```
 
@@ -49,6 +68,8 @@
 | `notify_on_start` | 开始优化时弹系统通知 |
 | `notify_on_stop` | 停止/自动还原时弹系统通知 |
 | `restore_on_exit` | 退出程序时还原可还原项 |
+| `hotkey_enabled` | 全局快捷键开关，等价于托盘里的「启用快捷键」 |
+| `hotkey` | 快捷键组合，默认 `Ctrl+F2`；改完需重启程序生效 |
 
 配置写坏时程序**按停用处理并记日志**，不会静默回退成"全开"——后台进程不该在配置有问题时继续结束进程、停服务。
 
@@ -133,6 +154,24 @@ cargo run --release --example wallpaper_not_running
 
 前两个需要管理员权限（要结束/启动进程），最后一个要求先退出 WE。
 
+## 验证快捷键
+
+三个例子都不改配置、不执行优化：
+
+```bat
+cargo run --example hotkey_probe
+cargo run --example hotkey_edit_gate
+cargo run --release --example hotkey_trigger
+```
+
+| 例子 | 覆盖内容 |
+|---|---|
+| `hotkey_probe` | 注册 `Ctrl+F2` 成功、重复注册被系统拒绝（1409）、`SendInput` 真按一次收到恰好 1 次 `WM_HOTKEY`、注销后组合键可被重新注册 |
+| `hotkey_edit_gate` | 焦点在 `Edit` 控件时判为编辑场景（应忽略），焦点在普通窗口时放行 |
+| `hotkey_trigger` | 走出货代码：总开关关闭时不触发、快捷键开关关闭时注销且不触发、真按一次投递 `Start` 并跑完一轮、连按被闸门拦住 |
+
+`hotkey_trigger` 只跑 `dns` 一项（刷新解析缓存，无副作用），跑完自动还原。
+
 ## 安装
 
 下载 `WGOpt-Core-<版本>-x64-setup.exe` 双击安装。安装程序与原版 WGOpt 的行为一致：
@@ -151,6 +190,12 @@ cargo run --release --example wallpaper_not_running
 ## 构建
 
 需要 Rust（GNU 工具链）、MinGW binutils，以及 NSIS。
+
+`PATH` 里必须有 `as.exe` 与 `dlltool.exe`，否则链接 `windows` crate 时会报
+`error calling dlltool 'dlltool.exe': program not found`。Rust 自带的
+`.../rustlib/x86_64-pc-windows-gnu/bin/self-contained/dlltool.exe` 不够用——
+它缺少 `as.exe`，链接阶段仍会失败。装一份完整的 MinGW-w64，或像原版仓库那样
+把工具链放在 `.toolchain\mingw64\bin` 并加进 `PATH`。
 
 ```bat
 deploy.cmd            :: 编译 exe 并部署托盘图标

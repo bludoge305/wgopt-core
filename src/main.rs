@@ -16,6 +16,7 @@ use std::rc::Rc;
 
 use wgopt_core::app::{self, Command, Phase, Shared, Status};
 use wgopt_core::config;
+use wgopt_core::hotkey::{self, HotkeyBinding};
 use wgopt_core::logging;
 use wgopt_core::single_instance;
 use wgopt_core::tray::{Command as TrayCommand, MenuChoice, MenuState, NotifyKind, Tray, TrayIcon};
@@ -94,6 +95,19 @@ fn main() {
     // 用 Rc<RefCell> 即可，不必引入 Mutex——那会在模态菜单期间死锁。
     let tray = Rc::new(RefCell::new(Some(tray)));
 
+    // ---- 4.5 全局快捷键 ----
+    // 同样只在主线程访问：注册、菜单里切换开关、WM_HOTKEY 回调都在这一条线程上
+    let hotkey_binding = Rc::new(RefCell::new(HotkeyBinding::new(hwnd)));
+    let hotkey_gate = Rc::new(RefCell::new(hotkey::TriggerGate::default()));
+    match sync_hotkey(&shared, &hotkey_binding) {
+        Ok(Some(hk)) => logging::info(&format!("全局快捷键已注册：{hk}")),
+        Ok(None) => logging::info("全局快捷键未启用"),
+        Err(e) => {
+            logging::warn(&format!("全局快捷键未生效：{e}"));
+            shared.notify("快捷键未生效", e, NotifyKind::Warn);
+        }
+    }
+
     // ---- 5. 后台检测线程 ----
     let worker = shared.clone();
     std::thread::Builder::new()
@@ -115,6 +129,10 @@ fn main() {
     let tray_tick = tray.clone();
     let tray_menu = tray.clone();
     let tray_reattach = tray.clone();
+    let shared_hotkey = shared.clone();
+    let hotkey_menu = hotkey_binding.clone();
+    let hotkey_cb = hotkey_binding.clone();
+    let gate_cb = hotkey_gate.clone();
 
     window::run_message_loop(window::Callbacks {
         tick: Box::new(move || {
@@ -133,13 +151,13 @@ fn main() {
             }
         }),
         show_menu: Box::new(move || {
-            let state = build_menu_state(&shared_menu);
+            let state = build_menu_state(&shared_menu, &hotkey_menu);
             let picked = match tray_menu.try_borrow() {
                 Ok(guard) => guard.as_ref().and_then(|t| t.popup_menu(&state)),
                 Err(_) => None,
             };
             if let Some(choice) = picked {
-                handle_choice(&shared_menu, choice);
+                handle_choice(&shared_menu, &hotkey_menu, choice);
             }
         }),
         reattach: Box::new(move || {
@@ -148,6 +166,12 @@ fn main() {
                     t.reattach();
                 }
             }
+        }),
+        hotkey: Box::new(move || {
+            let Ok(mut gate) = gate_cb.try_borrow_mut() else {
+                return;
+            };
+            trigger_hotkey(&shared_hotkey, &hotkey_cb, &mut gate);
         }),
     });
 
@@ -334,28 +358,67 @@ fn icon_for(status: &Status) -> TrayIcon {
     }
 }
 
-fn build_menu_state(shared: &Shared) -> MenuState {
+fn build_menu_state(shared: &Shared, binding: &Rc<RefCell<HotkeyBinding>>) -> MenuState {
     let status = shared.status_snapshot();
     let defs = wgopt_core::item_definitions();
-    let (auto, items) = match shared.config.lock() {
+    let (auto, items, hotkey_text) = match shared.config.lock() {
         Ok(cfg) => (
             cfg.auto_optimize,
             defs.iter().map(|d| cfg.is_item_enabled(&d.id)).collect(),
+            cfg.hotkey.clone(),
         ),
-        Err(_) => (true, vec![true; defs.len()]),
+        Err(_) => (true, vec![true; defs.len()], String::new()),
     };
+
+    // 勾选状态以「真的注册上了」为准：组合键被别的程序占用时，配置里
+    // 虽然写着 true，但按键并不生效，菜单不能骗人。
+    let registered = binding.try_borrow().ok().and_then(|b| b.active());
+    // 配置里写坏或为空时不展示按键，菜单里只剩开关本身
+    let hotkey_label = registered
+        .map(|hk| hk.to_string())
+        .or_else(|| hotkey::Hotkey::parse(&hotkey_text).ok().map(|hk| hk.to_string()))
+        .unwrap_or_default();
 
     MenuState {
         enabled: status.enabled,
         auto,
         autostart: config::is_autostart_enabled(),
         optimized: status.phase == Phase::Optimized,
+        hotkey_enabled: registered.is_some(),
+        hotkey_label,
         status_line: status.status_line(),
         items,
     }
 }
 
-fn handle_choice(shared: &Shared, choice: MenuChoice) {
+/// 按配置重新注册快捷键，返回生效的组合键（未启用为 `None`）。
+fn sync_hotkey(
+    shared: &Shared,
+    binding: &Rc<RefCell<HotkeyBinding>>,
+) -> Result<Option<hotkey::Hotkey>, String> {
+    let mut guard = binding
+        .try_borrow_mut()
+        .map_err(|_| "快捷键状态正忙，请重试".to_string())?;
+    hotkey::sync_binding(shared, &mut guard)
+}
+
+/// 快捷键触发：与点击托盘菜单的「立即开始优化」走同一条路径。
+fn trigger_hotkey(shared: &Shared, binding: &Rc<RefCell<HotkeyBinding>>, gate: &mut hotkey::TriggerGate) {
+    let Ok(guard) = binding.try_borrow() else {
+        return;
+    };
+    let outcome = hotkey::trigger(shared, &guard, gate, std::time::Instant::now());
+    drop(guard);
+
+    // 失败场景（不可用、间隔太短）也记一行：排障时能看出快捷键被按到了
+    logging::info(&outcome.log_line());
+}
+
+fn handle_choice(
+    shared: &Shared,
+    binding: &Rc<RefCell<HotkeyBinding>>,
+    choice: MenuChoice,
+) {
     match choice {
         MenuChoice::Command(TrayCommand::ToggleEnabled) => toggle_enabled(shared),
         MenuChoice::Command(TrayCommand::ToggleAuto) => toggle_auto(shared),
@@ -366,6 +429,7 @@ fn handle_choice(shared: &Shared, choice: MenuChoice) {
             shared.post_command(Command::Stop);
         }
         MenuChoice::Command(TrayCommand::ToggleAutostart) => toggle_autostart(shared),
+        MenuChoice::Command(TrayCommand::ToggleHotkey) => toggle_hotkey(shared, binding),
         MenuChoice::Command(TrayCommand::OpenConfig) => open_config_dir(),
         MenuChoice::Command(TrayCommand::Quit) => {
             shared.post_command(Command::Shutdown);
@@ -439,6 +503,46 @@ fn toggle_autostart(shared: &Shared) {
         Err(e) => {
             logging::error(&format!("设置开机自启失败：{e}"));
             shared.notify("开机自启设置失败", e, NotifyKind::Error);
+        }
+    }
+}
+
+/// 切换快捷键开关：立刻注册/注销，并把结果写回配置。
+///
+/// 以「现在是否真的注册着」为基准翻转，而不是读配置里的期望值：启动时
+/// 组合键可能已被别的程序占用（配置写着 true 但没注册成功），按配置取反
+/// 会让用户第一下点击变成"关"，得点两次才能生效。
+///
+/// 注册失败（组合键被别的程序占用）时回滚配置，避免下次启动仍按"已开启"重试。
+fn toggle_hotkey(shared: &Shared, binding: &Rc<RefCell<HotkeyBinding>>) {
+    let currently_active = binding
+        .try_borrow()
+        .map(|b| b.active().is_some())
+        .unwrap_or(false);
+    let target = !currently_active;
+
+    let mut now = false;
+    app::persist(shared, |cfg| {
+        cfg.hotkey_enabled = target;
+        now = cfg.hotkey_enabled;
+    });
+
+    match sync_hotkey(shared, binding) {
+        Ok(Some(hk)) => {
+            logging::info(&format!("快捷键已开启：{hk}"));
+            shared.notify("WGOpt", format!("已启用快捷键 {hk}"), NotifyKind::Info);
+        }
+        Ok(None) => {
+            logging::info("快捷键已关闭");
+            shared.notify("WGOpt", "已关闭快捷键", NotifyKind::Info);
+        }
+        Err(e) => {
+            logging::warn(&format!("快捷键开启失败：{e}"));
+            if now {
+                // 写回关闭状态，下次启动不再尝试注册这个组合键
+                app::persist(shared, |cfg| cfg.hotkey_enabled = false);
+            }
+            shared.notify("快捷键未生效", e, NotifyKind::Warn);
         }
     }
 }

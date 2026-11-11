@@ -12,6 +12,7 @@
 //! - [`engine`]：8 项优化与还原
 //! - [`gpu`]：GPU 占用采集（PDH 性能计数器）
 //! - [`game_detect`]：游戏识别（GPU 为主判据 + 多维加权）
+//! - [`hotkey`]：全局快捷键（`RegisterHotKey`）与编辑场景判定
 //! - [`config`]：配置文件读写与开机自启
 //! - [`app`]：后台守护状态机与自动优化
 //! - [`tray`]：托盘图标、菜单与通知
@@ -25,6 +26,7 @@ pub mod elevate;
 pub mod engine;
 pub mod game_detect;
 pub mod gpu;
+pub mod hotkey;
 pub mod item;
 pub mod logging;
 pub mod single_instance;

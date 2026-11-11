@@ -178,6 +178,14 @@ impl Shared {
         self.status.lock().map(|s| s.phase).unwrap_or(Phase::Idle)
     }
 
+    /// 「立即开始优化」此刻是否可用：总开关开着，且不是在优化中/已优化。
+    ///
+    /// 托盘菜单的灰化条件与全局快捷键共用这一判定，快捷键不会绕过菜单限制。
+    pub fn can_start(&self) -> bool {
+        let enabled = self.config.lock().map(|c| c.enabled).unwrap_or(true);
+        enabled && !matches!(self.phase(), Phase::Optimizing | Phase::Optimized)
+    }
+
     pub fn status_snapshot(&self) -> Status {
         self.status.lock().map(|s| s.clone()).unwrap_or_default()
     }
@@ -616,5 +624,33 @@ mod tests {
     #[test]
     fn both_on_keeps_detection() {
         assert!(detection_enabled(true, true));
+    }
+
+    /// 快捷键与托盘菜单共用同一可用性判定：总开关关闭、优化中、已优化
+    /// 都不可再点「立即开始优化」。
+    #[test]
+    fn can_start_mirrors_menu_gating() {
+        let mut cfg = Config::default();
+        cfg.enabled = true;
+        let shared = Shared::new(cfg);
+        assert!(shared.can_start(), "待机且总开关开着应可开始");
+
+        if let Ok(mut st) = shared.status.lock() {
+            st.phase = Phase::Optimizing;
+        }
+        assert!(!shared.can_start(), "优化中不能再开始");
+
+        if let Ok(mut st) = shared.status.lock() {
+            st.phase = Phase::Optimized;
+        }
+        assert!(!shared.can_start(), "已优化生效时不能再开始");
+
+        if let Ok(mut st) = shared.status.lock() {
+            st.phase = Phase::Idle;
+        }
+        if let Ok(mut c) = shared.config.lock() {
+            c.enabled = false;
+        }
+        assert!(!shared.can_start(), "总开关关闭后不可开始");
     }
 }

@@ -30,6 +30,10 @@ pub struct Config {
     pub notify_on_stop: bool,
     /// 自动结束不可还原项（关闭的后台进程等），不会自动拉起
     pub restore_on_exit: bool,
+    /// 全局快捷键开关：关闭后不再注册快捷键
+    pub hotkey_enabled: bool,
+    /// 「立即开始优化」的全局快捷键，如 `Ctrl+F2`
+    pub hotkey: String,
 }
 
 fn default_true() -> bool {
@@ -38,6 +42,10 @@ fn default_true() -> bool {
 
 fn default_enabled_items() -> Vec<String> {
     item::item_definitions().into_iter().map(|i| i.id).collect()
+}
+
+fn default_hotkey() -> String {
+    crate::hotkey::DEFAULT_HOTKEY.to_string()
 }
 
 impl Default for Config {
@@ -50,6 +58,8 @@ impl Default for Config {
             notify_on_start: default_true(),
             notify_on_stop: default_true(),
             restore_on_exit: default_true(),
+            hotkey_enabled: true,
+            hotkey: default_hotkey(),
         }
     }
 }
@@ -85,6 +95,17 @@ impl Config {
         } else if !on && has {
             self.enabled_items.retain(|x| x != id);
         }
+    }
+
+    /// 解析生效的快捷键。
+    ///
+    /// 开关关闭返回 `Ok(None)`；格式非法返回 `Err` 而不是静默失败——
+    /// 非法配置只影响快捷键本身，不改变「写坏配置按停用处理」那条约束。
+    pub fn active_hotkey(&self) -> Result<Option<crate::hotkey::Hotkey>, String> {
+        if !self.hotkey_enabled {
+            return Ok(None);
+        }
+        crate::hotkey::Hotkey::parse(&self.hotkey).map(Some)
     }
 }
 
@@ -333,5 +354,67 @@ mod tests {
         assert!(!cfg.enabled, "损坏的配置必须让总开关关闭");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_hotkey_is_ctrl_f2_and_enabled() {
+        let cfg = Config::default();
+        assert!(cfg.hotkey_enabled);
+        let hk = cfg.active_hotkey().unwrap().expect("默认应返回组合键");
+        assert_eq!(hk.to_string(), "Ctrl+F2");
+    }
+
+    /// 旧配置文件没有这两个字段时按默认补齐，且不影响总开关的判定。
+    #[test]
+    fn old_config_without_hotkey_gets_default() {
+        let dir = std::env::temp_dir().join("wgopt-test-old-hotkey");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(FILE_NAME), r#"{"enabled":true}"#).unwrap();
+
+        let cfg = load_from_dir(&dir);
+        assert!(cfg.enabled);
+        assert!(cfg.hotkey_enabled);
+        assert_eq!(cfg.hotkey, crate::hotkey::DEFAULT_HOTKEY);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hotkey_switch_off_yields_none() {
+        let cfg = Config {
+            hotkey_enabled: false,
+            ..Default::default()
+        };
+        assert!(cfg.active_hotkey().unwrap().is_none());
+    }
+
+    /// 快捷键写错只报错，不能让整个配置按停用处理——否则用户改错一个
+    /// 按键名，后台就不再优化了。
+    #[test]
+    fn invalid_hotkey_keeps_config_usable() {
+        let dir = std::env::temp_dir().join("wgopt-test-bad-hotkey");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(FILE_NAME),
+            r#"{"enabled":true,"hotkey":"Ctrl+NotAKey"}"#,
+        )
+        .unwrap();
+
+        let cfg = load_from_dir(&dir);
+        assert!(cfg.enabled, "按键写错不影响总开关");
+        assert!(cfg.active_hotkey().is_err(), "非法组合键要能被识别");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_hotkey_roundtrips() {
+        let cfg = Config {
+            hotkey: "Alt+Shift+F9".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.active_hotkey().unwrap().unwrap().to_string(), "Alt+Shift+F9");
     }
 }
