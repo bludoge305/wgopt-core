@@ -10,6 +10,10 @@
 //!  ▲                                                    │
 //!  └────────────── 游戏退出满 6 秒 ────────────────────┘
 //! ```
+//!
+//! 「游戏运行时自动优化」是后台检测的开关，不只是"检测到要不要执行"：
+//! 关闭后整个轮询停用——不采样 CPU/GPU、不识别、不提示、不随程序启动；
+//! 重新开启时重建采样基线后恢复，与程序刚启动时一致。
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -125,6 +129,8 @@ pub enum Command {
     Start,
     /// 停止优化并还原
     Stop,
+    /// 配置已改：立刻重新判定检测开关，不等下一个轮询周期
+    ConfigChanged,
     /// 退出：还原后结束进程
     Shutdown,
 }
@@ -237,32 +243,71 @@ impl Shared {
     }
 }
 
+/// 后台检测闸门。
+///
+/// 「游戏运行时自动优化」同时就是后台检测的开关：关掉它以后轮询线程
+/// 不采样 CPU/GPU、不识别游戏、也不提示。总开关关闭时同理。
+fn detection_enabled(enabled: bool, auto: bool) -> bool {
+    enabled && auto
+}
+
+/// 建立采样基线：GPU 计数器与 CPU 差值都要两次读数才有意义。
+/// 检测从停用切回启用时必须重来一遍，否则第一次读数是跨越整段停用
+/// 时间的累计值，游戏会被一次性算成满占用。
+fn prime_detection(cpu: &mut CpuSampler, gpu: &mut Option<GpuSampler>) {
+    let _ = cpu.sample();
+    if gpu.is_none() {
+        *gpu = GpuSampler::new();
+    }
+    if let Some(g) = gpu.as_mut() {
+        let _ = g.collect();
+    }
+}
+
 /// 后台守护循环（阻塞调用线程）。
 pub fn run_guardian(shared: Arc<Shared>) -> ! {
     let mut cpu = CpuSampler::new();
-    let mut gpu = GpuSampler::new();
+    // GPU 采集器按需创建：检测停用时连 PDH 查询都不必打开
+    let mut gpu: Option<GpuSampler> = None;
     let mut exit_at: Option<Instant> = None;
     let mut last_game_pid: Option<u32> = None;
     let mut next_poll = Instant::now();
+    // 采样基线是否已经建立。检测停用期间保持 false，恢复时重新预热。
+    let mut detecting = false;
+    // 当前生效的优化是不是「检测到游戏」自动触发的。关闭自动优化时只还原
+    // 这一种；手点「立即开始优化」的结果不归这个开关管。
+    let mut auto_applied = false;
 
-    logging::info("后台检测已启动（间隔 3 秒）");
-    // 首轮采样只建立基线：GPU 计数器要两次读数才有意义
-    let _ = cpu.sample();
-    if let Some(g) = gpu.as_mut() {
-        let _ = g.collect();
+    logging::info("后台守护已启动（轮询间隔 3 秒）");
+
+    // 自动优化关闭时一次采样都不做——进程启动后不该有任何检测动作
+    let initial = match shared.config.lock() {
+        Ok(cfg) => (cfg.enabled, cfg.auto_optimize),
+        Err(_) => (true, true),
+    };
+    if detection_enabled(initial.0, initial.1) {
+        prime_detection(&mut cpu, &mut gpu);
+        detecting = true;
+    } else {
+        logging::info("自动优化已关闭：本次启动不做游戏检测");
     }
 
     loop {
         // ---- 1. 先处理命令，让用户操作即时生效 ----
+        // 配置变更后不等下一个轮询周期，立刻重跑一轮判定。
+        let mut recheck = false;
         while let Some(cmd) = shared.take_command() {
             match cmd {
                 Command::Start => {
                     let game = shared.status_snapshot().game.map(|g| g.name);
+                    auto_applied = false;
                     optimize_now(&shared, game);
                 }
                 Command::Stop => {
+                    auto_applied = false;
                     restore_now(&shared, "已手动停止优化，可还原项已恢复");
                 }
+                Command::ConfigChanged => recheck = true,
                 Command::Shutdown => {
                     if shared.phase() == Phase::Optimized {
                         restore_now(&shared, "程序退出，已自动恢复");
@@ -276,6 +321,11 @@ pub fn run_guardian(shared: Arc<Shared>) -> ! {
 
         if shared.quit_requested() {
             exit_process();
+        }
+
+        // 配置刚变过：把下一次轮询提前到现在，让开关立即生效
+        if recheck {
+            next_poll = Instant::now();
         }
 
         // ---- 2. 到点才做游戏检测 ----
@@ -299,6 +349,51 @@ pub fn run_guardian(shared: Arc<Shared>) -> ! {
             }
             last_game_pid = None;
             exit_at = None;
+            detecting = false;
+            auto_applied = false;
+            continue;
+        }
+
+        // 自动优化关闭：后台检测整体停用。
+        // 不采样 CPU/GPU、不识别、不提示；清掉上一轮的识别结果，让托盘
+        // 不再显示游戏名。
+        if !detection_enabled(enabled, auto) {
+            if detecting {
+                logging::info("自动优化已关闭：后台游戏检测已停用");
+                detecting = false;
+                // PDH 查询句柄一并释放，停用期间不占采集资源
+                gpu = None;
+            }
+            last_game_pid = None;
+            exit_at = None;
+            // 自动触发的那轮优化要跟着还原：检测一停，就再没人观察游戏何时
+            // 退出，快照里的优先级、服务、Wallpaper Engine 会一直留着。
+            // 手点「立即开始优化」的结果不归这个开关管，保持不动。
+            if auto_applied && shared.phase() == Phase::Optimized {
+                restore_now(&shared, "自动优化已关闭，已恢复");
+                auto_applied = false;
+            }
+            let mut cleared = false;
+            if let Ok(mut st) = shared.status.lock() {
+                cleared = st.game.take().is_some();
+                if cleared {
+                    st.message = "自动优化已关闭，后台检测已停用".into();
+                }
+            }
+            if cleared {
+                logging::info("自动优化已关闭：已清除上一轮的游戏识别结果");
+            }
+            continue;
+        }
+
+        // 从"检测停用"切回"检测启用"：先重建采样基线。
+        // CPU 采样差值与 GPU 计数器都依赖两次读数，停用期间基线是旧的，
+        // 直接拿去算会得到跨了整段停用时间的假占用（游戏可能一次性满分）。
+        if !detecting {
+            prime_detection(&mut cpu, &mut gpu);
+            detecting = true;
+            logging::info("后台游戏检测已启用（采样基线已重建）");
+            next_poll = Instant::now() + POLL_INTERVAL;
             continue;
         }
 
@@ -332,21 +427,13 @@ pub fn run_guardian(shared: Arc<Shared>) -> ! {
                     game.name, game.pid, game.score
                 ));
 
-                if auto {
-                    shared.notify(
-                        "检测到游戏",
-                        format!("{label}，正在自动优化"),
-                        NotifyKind::Info,
-                    );
-                    optimize_now(&shared, Some(game.name.clone()));
-                } else {
-                    logging::info("自动优化已关闭：仅提示，不执行");
-                    shared.notify(
-                        "检测到游戏",
-                        format!("{label}（自动优化已关闭）"),
-                        NotifyKind::Warn,
-                    );
-                }
+                shared.notify(
+                    "检测到游戏",
+                    format!("{label}，正在自动优化"),
+                    NotifyKind::Info,
+                );
+                auto_applied = true;
+                optimize_now(&shared, Some(game.name.clone()));
             }
             None => {
                 if last_game_pid.is_none() {
@@ -374,6 +461,7 @@ pub fn run_guardian(shared: Arc<Shared>) -> ! {
                 if shared.phase() == Phase::Optimized {
                     restore_now(&shared, "游戏已退出，已自动恢复");
                 }
+                auto_applied = false;
             }
         }
     }
@@ -502,4 +590,29 @@ pub fn persist(shared: &Shared, mutate: impl FnOnce(&mut Config)) {
 
 fn exit_process() -> ! {
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 「游戏运行时自动优化」同时是后台检测的开关：
+    /// 关闭它以后不得再采样、识别或提示。
+    #[test]
+    fn auto_off_disables_detection() {
+        assert!(!detection_enabled(true, false));
+    }
+
+    /// 总开关关闭时自动优化是否开启都不检测。
+    #[test]
+    fn master_off_disables_detection() {
+        assert!(!detection_enabled(false, true));
+        assert!(!detection_enabled(false, false));
+    }
+
+    /// 两个开关都开时保持原有行为。
+    #[test]
+    fn both_on_keeps_detection() {
+        assert!(detection_enabled(true, true));
+    }
 }

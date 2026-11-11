@@ -401,12 +401,14 @@ fn toggle_auto(shared: &Shared) {
         now = cfg.auto_optimize;
     });
     logging::info(&format!("自动优化切换为 {}", now));
+    // 这个开关同时控制后台检测，唤醒守护线程立刻停用/恢复，不等下一轮
+    shared.post_command(Command::ConfigChanged);
     shared.notify(
         "WGOpt",
         if now {
-            "已开启：检测到游戏后自动优化"
+            "已开启：恢复后台检测，检测到游戏后自动优化"
         } else {
-            "已关闭自动优化：仅提示"
+            "已关闭：后台已停止检测游戏"
         },
         NotifyKind::Info,
     );
