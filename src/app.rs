@@ -502,8 +502,10 @@ pub fn optimize_now(shared: &Shared, game: Option<String>) -> Vec<ItemResult> {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        // 每次全量优化前重置快照，避免同一 pid 重复累积
-        *snap = Snapshot::default();
+        // 每次全量优化前重置快照，避免同一 pid 重复累积。但「本程序关闭、
+        // 尚未还原」的程序必须带过来：连续两轮优化之间没有经过 restore，
+        // 清掉它等于把上一轮关掉的 Wallpaper Engine 永久留在关闭状态。
+        snap.reset_keeping_pending_programs();
         engine::run_items(&ids, game.as_deref(), &mut snap)
     };
 

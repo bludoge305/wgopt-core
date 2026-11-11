@@ -17,6 +17,19 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// 开始新一轮优化前清空快照，避免同一 pid 的降级记录重复累积。
+    ///
+    /// 但「本程序关闭、尚未还原」的程序必须带过来：连续两轮优化之间没有
+    /// 经过 restore，丢掉它等于把上一轮关掉的 Wallpaper Engine 永久留在
+    /// 关闭状态——进程已经不在了，下一轮再也查不到它的路径。
+    pub fn reset_keeping_pending_programs(&mut self) {
+        let pending = std::mem::take(&mut self.killed_programs);
+        *self = Snapshot {
+            killed_programs: pending,
+            ..Snapshot::default()
+        };
+    }
+
     pub fn is_empty(&self) -> bool {
         self.demoted.is_empty()
             && self.promoted.is_empty()
@@ -76,5 +89,23 @@ mod tests {
         )
         .unwrap();
         assert!(snap.killed_programs.is_empty());
+    }
+
+    /// 新一轮优化不能丢掉上一轮关掉、还没还原的程序，
+    /// 否则 Wallpaper Engine 会一直关着——进程已消失，再也查不到路径。
+    #[test]
+    fn reset_keeps_pending_programs() {
+        let mut snap = Snapshot {
+            demoted: vec![(100, "onedrive.exe".into(), "正常".into())],
+            stopped_services: vec!["WSearch".into()],
+            killed_programs: vec![r"D:\WE\wallpaper64.exe".into()],
+            ..Default::default()
+        };
+        snap.reset_keeping_pending_programs();
+
+        assert_eq!(snap.killed_programs, vec![r"D:\WE\wallpaper64.exe".to_string()]);
+        assert!(snap.demoted.is_empty(), "降级记录要清掉，避免同一 pid 重复累积");
+        assert!(snap.stopped_services.is_empty());
+        assert!(!snap.is_empty(), "还有待还原的程序，快照不算空");
     }
 }

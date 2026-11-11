@@ -77,6 +77,18 @@
 `wallpaper` 在结束进程**之前**先记下它的可执行文件路径，还原时按该路径重新启动；
 若用户已经自己把 Wallpaper Engine 开回来了，则不会启动第二份。
 
+`background` 的白名单里同样包含 Wallpaper Engine（原版策略如此）。默认顺序下它排在
+`wallpaper` 之前，实际是它先结束 `wallpaper64.exe`，随后的 `wallpaper` 项只看得到
+「未检测到」。所以 `background` 在结束 Wallpaper Engine 前也会记录路径，两项共用同一份
+快照字段与还原逻辑：
+
+- 只还原**本程序关掉**的进程。优化时原本没运行就没有记录，还原不做任何事
+- 一次优化可能关掉主进程与 UI/Web 子进程，还原只启动一个主进程，其余由它自行派生
+- 还原前按进程名检查（32/64 位主进程都算），用户手动开回来或已经重启过则不重复启动
+- 启动后隔一段时间复查进程是否仍在：缺运行库、Steam 未启动导致立即退出的，
+  如实报「失败」而不是「已重新启动」
+- 连续两轮优化中间没有还原时，待还原的关闭记录会带进下一轮，不会被快照重置丢掉
+
 ## 游戏识别
 
 沿用原版 v1.3.0 起的方案：以 **GPU 3D 引擎占用**为主判据
@@ -100,6 +112,26 @@ wgopt --version
 ```
 
 日志在 `%APPDATA%\WGOpt\wgopt.log`，单文件上限 512 KB 自动滚动。
+
+## 验证 Wallpaper Engine 还原
+
+还原链路需要真实进程，用 examples 走托盘同一对函数：
+
+```bat
+cargo run --release --example wallpaper_roundtrip
+cargo run --release --example wallpaper_restore_edges
+cargo run --release --example wallpaper_manual_recover
+cargo run --release --example wallpaper_not_running
+```
+
+| 例子 | 覆盖内容 |
+|---|---|
+| `wallpaper_roundtrip` | 关闭 → 还原重启；`background` 先命中的路径；连续两轮优化不还原 |
+| `wallpaper_restore_edges` | 已在运行不重启、路径失效、启动后立即退出、空快照不动作 |
+| `wallpaper_manual_recover` | 优化后用户手动开回 WE，还原不启动第二份 |
+| `wallpaper_not_running` | 优化时 WE 原本未运行，快照为空、还原不凭空启动 |
+
+前两个需要管理员权限（要结束/启动进程），最后一个要求先退出 WE。
 
 ## 安装
 
