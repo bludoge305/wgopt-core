@@ -61,8 +61,9 @@ manifests`。提权走运行时 `ShellExecuteExW(runas)`，与原版一致。
 全局热键会吞掉正常输入。注册时始终附带 `MOD_NOREPEAT`，连按另由
 `TriggerGate`（1 秒）兜底，两道闸缺一不可。
 
-**快捷键与托盘菜单共用 `Shared::can_start`。** 别在快捷键路径上另写一份可用性
-判断，否则会出现「菜单灰了但按快捷键还能跑」的不一致。
+**快捷键与托盘菜单共用 `Shared::toggle_action` / `request_toggle`。** 「立即开始优化」
+与「停止优化并还原」是同一个状态开关的两个方向，判定只能有一份。别在快捷键或菜单
+路径上另写可用性判断，否则会出现「菜单灰了但按快捷键还能跑」或两边方向不一致。
 
 **编辑场景判定不要加浏览器类名黑名单。** 网页游戏的前台窗口就是
 `Chrome_RenderWidgetHostHWND` 这类通用窗口类，加进去会让网页游戏里按不了
@@ -144,7 +145,7 @@ cargo run --release --example wallpaper_restore_edges :: 重复启动、路径�
 ```bat
 cargo run --example hotkey_probe                     :: 注册/重复注册被拒/真按一次/注销
 cargo run --example hotkey_edit_gate                 :: Edit 控件内忽略，普通窗口放行
-cargo run --release --example hotkey_trigger         :: 走出货代码，跑一轮 dns 项
+cargo run --release --example hotkey_trigger         :: 状态切换：开始 → 还原 → 再开始
 ```
 
 `hotkey_probe` 与 `hotkey_trigger` 都用 `SendInput` 真的按 Ctrl+F2，跑之前先确认

@@ -383,7 +383,8 @@ fn build_menu_state(shared: &Shared, binding: &Rc<RefCell<HotkeyBinding>>) -> Me
         enabled: status.enabled,
         auto,
         autostart: config::is_autostart_enabled(),
-        optimized: status.phase == Phase::Optimized,
+        // 菜单文案与灰化来自同一个判定，快捷键也用它
+        toggle: shared.toggle_action(),
         hotkey_enabled: registered.is_some(),
         hotkey_label,
         status_line: status.status_line(),
@@ -402,7 +403,7 @@ fn sync_hotkey(
     hotkey::sync_binding(shared, &mut guard)
 }
 
-/// 快捷键触发：与点击托盘菜单的「立即开始优化」走同一条路径。
+/// 快捷键触发：按当前状态切换，与点击托盘菜单的切换项走同一个函数。
 fn trigger_hotkey(shared: &Shared, binding: &Rc<RefCell<HotkeyBinding>>, gate: &mut hotkey::TriggerGate) {
     let Ok(guard) = binding.try_borrow() else {
         return;
@@ -422,11 +423,13 @@ fn handle_choice(
     match choice {
         MenuChoice::Command(TrayCommand::ToggleEnabled) => toggle_enabled(shared),
         MenuChoice::Command(TrayCommand::ToggleAuto) => toggle_auto(shared),
-        MenuChoice::Command(TrayCommand::Start) => {
-            shared.post_command(Command::Start);
-        }
-        MenuChoice::Command(TrayCommand::Stop) => {
-            shared.post_command(Command::Stop);
+        // 菜单点击与快捷键共用同一个状态切换入口，不各自判断方向
+        MenuChoice::Command(TrayCommand::ToggleRun) => {
+            let (action, command) = shared.request_toggle();
+            match command {
+                Some(cmd) => logging::info(&format!("菜单执行：{}（{cmd:?}）", action.label())),
+                None => logging::info(&format!("菜单点击被忽略：{}", action.label())),
+            }
         }
         MenuChoice::Command(TrayCommand::ToggleAutostart) => toggle_autostart(shared),
         MenuChoice::Command(TrayCommand::ToggleHotkey) => toggle_hotkey(shared, binding),

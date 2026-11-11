@@ -460,14 +460,14 @@ pub fn sync_binding(
 /// 一次快捷键触发的处理结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TriggerOutcome {
-    /// 已投递「立即开始优化」
-    Started,
+    /// 已按当前状态投递切换命令
+    Toggled(crate::app::ToggleAction),
     /// 当前没有注册成功的快捷键
     NotRegistered,
     /// 处于输入/编辑场景，已忽略（附命中原因）
     Editing(&'static str),
-    /// 「立即开始优化」此刻不可用（总开关关闭，或已优化生效）
-    NotAvailable,
+    /// 当前状态不可切换（正在优化，或总开关关闭）
+    NotAvailable(crate::app::ToggleAction),
     /// 与上一次触发间隔太短
     TooFrequent,
 }
@@ -475,22 +475,33 @@ pub enum TriggerOutcome {
 impl TriggerOutcome {
     /// 写日志用的一句话。
     pub fn log_line(&self) -> String {
+        use crate::app::ToggleAction;
         match self {
-            TriggerOutcome::Started => "快捷键触发：立即开始优化".into(),
+            TriggerOutcome::Toggled(ToggleAction::Start) => {
+                "快捷键触发：立即开始优化".into()
+            }
+            TriggerOutcome::Toggled(ToggleAction::Stop) => {
+                "快捷键触发：停止优化并还原".into()
+            }
+            // 其余分支理论上不会出现，真出现说明 command 映射漏了一种
+            TriggerOutcome::Toggled(other) => {
+                format!("快捷键触发：{}（该状态本不该投递命令）", other.label())
+            }
             TriggerOutcome::NotRegistered => "快捷键已忽略：当前没有注册成功".into(),
             TriggerOutcome::Editing(why) => format!("快捷键已忽略：{why}"),
-            TriggerOutcome::NotAvailable => {
-                "快捷键已忽略：当前不可开始优化（总开关关闭或已优化）".into()
+            TriggerOutcome::NotAvailable(action) => {
+                format!("快捷键已忽略：当前状态不可切换（{}）", action.label())
             }
             TriggerOutcome::TooFrequent => "快捷键已忽略：与上次触发间隔过短".into(),
         }
     }
 }
 
-/// 处理一次快捷键按下。
+/// 处理一次快捷键按下：按当前优化状态切换（未优化→开始，已优化→还原）。
 ///
-/// 与点击托盘菜单的「立即开始优化」行为一致：投递 `Command::Start`，由
-/// 后台线程执行。三道闸按代价从低到高排列——不可用时连场景判断都不做。
+/// 判定与投递全部交给 [`crate::app::Shared::request_toggle`]，与托盘菜单点击
+/// 走同一个函数——菜单能做的切换，快捷键就能做；菜单灰掉的，快捷键也不做。
+/// 四道闸按代价从低到高排列。
 pub fn trigger(
     shared: &crate::app::Shared,
     binding: &HotkeyBinding,
@@ -500,18 +511,26 @@ pub fn trigger(
     if binding.active().is_none() {
         return TriggerOutcome::NotRegistered;
     }
-    if !shared.can_start() {
-        return TriggerOutcome::NotAvailable;
+    let action = shared.toggle_action();
+    if !action.is_available() {
+        return TriggerOutcome::NotAvailable(action);
     }
     if let Some(why) = editing_reason() {
         return TriggerOutcome::Editing(why);
     }
+    // 闸门放在最后：只有"真要执行"时才消耗时间戳，避免被忽略的按键
+    // 把窗口往后推。
     if !gate.accept(now) {
         return TriggerOutcome::TooFrequent;
     }
 
-    shared.post_command(crate::app::Command::Start);
-    TriggerOutcome::Started
+    // 重新判定一次再投递：上面几道闸之间状态可能已经变了（例如后台刚跑完
+    // 一轮优化）。request_toggle 内部判定与投递是原子的，以它为准。
+    let (action, command) = shared.request_toggle();
+    match command {
+        Some(_) => TriggerOutcome::Toggled(action),
+        None => TriggerOutcome::NotAvailable(action),
+    }
 }
 
 #[cfg(test)]

@@ -135,6 +135,40 @@ pub enum Command {
     Shutdown,
 }
 
+/// 「优化状态切换」此刻能做什么。
+///
+/// 「立即开始优化」与「停止优化并还原」不是两个独立功能，而是同一个开关的
+/// 两个方向。菜单文案、菜单可用性、快捷键行为全部由 [`Shared::toggle_action`]
+/// 这一个判定产出，避免三处各写一套条件而互相漂移。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToggleAction {
+    /// 未优化：可执行「立即开始优化」
+    Start,
+    /// 已优化：可执行「停止优化并还原」
+    Stop,
+    /// 正在优化：两个方向都不可操作，等这一轮结束
+    Busy,
+    /// 总开关关闭：不优化也不还原
+    Disabled,
+}
+
+impl ToggleAction {
+    /// 菜单/按钮文案。
+    pub fn label(self) -> &'static str {
+        match self {
+            ToggleAction::Start => "立即开始优化",
+            ToggleAction::Stop => "停止优化并还原",
+            ToggleAction::Busy => "优化进行中…",
+            ToggleAction::Disabled => "立即开始优化",
+        }
+    }
+
+    /// 是否可点击（可点击才允许快捷键触发）。
+    pub fn is_available(self) -> bool {
+        matches!(self, ToggleAction::Start | ToggleAction::Stop)
+    }
+}
+
 /// 运行期共享状态。
 pub struct Shared {
     pub config: Mutex<Config>,
@@ -178,12 +212,35 @@ impl Shared {
         self.status.lock().map(|s| s.phase).unwrap_or(Phase::Idle)
     }
 
-    /// 「立即开始优化」此刻是否可用：总开关开着，且不是在优化中/已优化。
-    ///
-    /// 托盘菜单的灰化条件与全局快捷键共用这一判定，快捷键不会绕过菜单限制。
-    pub fn can_start(&self) -> bool {
+    /// 当前的优化状态切换动作。**菜单与快捷键都必须走这里**，不要另写判断。
+    pub fn toggle_action(&self) -> ToggleAction {
+        // 总开关关闭时既不做优化也不做还原，与后台守护线程的处理一致
         let enabled = self.config.lock().map(|c| c.enabled).unwrap_or(true);
-        enabled && !matches!(self.phase(), Phase::Optimizing | Phase::Optimized)
+        if !enabled {
+            return ToggleAction::Disabled;
+        }
+        match self.phase() {
+            Phase::Idle => ToggleAction::Start,
+            Phase::Optimized => ToggleAction::Stop,
+            Phase::Optimizing => ToggleAction::Busy,
+        }
+    }
+
+    /// 判定并投递切换命令，返回判定结果与实际投递的命令。
+    ///
+    /// 判定与投递在同一个函数里，调用方拿不到"判断了但不投递"或
+    /// "投递了但没判断"的中间态——菜单点击与快捷键触发都只调这一个。
+    pub fn request_toggle(&self) -> (ToggleAction, Option<Command>) {
+        let action = self.toggle_action();
+        let command = match action {
+            ToggleAction::Start => Some(Command::Start),
+            ToggleAction::Stop => Some(Command::Stop),
+            ToggleAction::Busy | ToggleAction::Disabled => None,
+        };
+        if let Some(cmd) = command {
+            self.post_command(cmd);
+        }
+        (action, command)
     }
 
     pub fn status_snapshot(&self) -> Status {
@@ -566,6 +623,12 @@ pub fn restore_now(shared: &Shared, reason: &str) -> Vec<String> {
     for m in &messages {
         logging::info(m);
     }
+    // 逐项消息只在真的动了什么时才有；补一行说明"是谁触发的还原"，
+    // 否则日志里看不出还原发生过（例如只跑了 dns 这种无可还原项时）。
+    logging::info(&format!(
+        "停止优化：{reason}（还原 {} 项改动）",
+        messages.len()
+    ));
 
     let notify = shared.config.lock().map(|c| c.notify_on_stop).unwrap_or(true);
 
@@ -626,31 +689,89 @@ mod tests {
         assert!(detection_enabled(true, true));
     }
 
-    /// 快捷键与托盘菜单共用同一可用性判定：总开关关闭、优化中、已优化
-    /// 都不可再点「立即开始优化」。
+    /// 「开始」与「还原」是同一个开关的两个方向：待机时给 Start，
+    /// 已优化时给 Stop。菜单文案、灰化与快捷键行为都只认这一个判定。
     #[test]
-    fn can_start_mirrors_menu_gating() {
+    fn toggle_action_follows_phase() {
+        let shared = Shared::new(Config::default());
+        assert_eq!(shared.toggle_action(), ToggleAction::Start);
+        assert_eq!(shared.toggle_action().label(), "立即开始优化");
+
+        set_phase_for_test(&shared, Phase::Optimizing);
+        assert_eq!(shared.toggle_action(), ToggleAction::Busy);
+        assert!(!shared.toggle_action().is_available(), "优化中不可操作");
+
+        set_phase_for_test(&shared, Phase::Optimized);
+        assert_eq!(shared.toggle_action(), ToggleAction::Stop);
+        assert_eq!(shared.toggle_action().label(), "停止优化并还原");
+    }
+
+    /// 总开关关闭时两个方向都不可用。
+    #[test]
+    fn toggle_action_disabled_when_master_off() {
         let mut cfg = Config::default();
-        cfg.enabled = true;
+        cfg.enabled = false;
         let shared = Shared::new(cfg);
-        assert!(shared.can_start(), "待机且总开关开着应可开始");
+        assert_eq!(shared.toggle_action(), ToggleAction::Disabled);
+        assert!(!shared.toggle_action().is_available());
 
-        if let Ok(mut st) = shared.status.lock() {
-            st.phase = Phase::Optimizing;
-        }
-        assert!(!shared.can_start(), "优化中不能再开始");
+        // 即使残留了"已优化"状态，关闭总开关也不该让还原变成可点
+        set_phase_for_test(&shared, Phase::Optimized);
+        assert_eq!(shared.toggle_action(), ToggleAction::Disabled);
+    }
 
-        if let Ok(mut st) = shared.status.lock() {
-            st.phase = Phase::Optimized;
-        }
-        assert!(!shared.can_start(), "已优化生效时不能再开始");
+    /// 判定与投递是同一个函数：返回的命令与判定必须一致，不可用的状态
+    /// 不得投递任何命令。
+    #[test]
+    fn request_toggle_matches_action() {
+        let shared = Shared::new(Config::default());
+        let (action, command) = shared.request_toggle();
+        assert_eq!(action, ToggleAction::Start);
+        assert_eq!(command, Some(Command::Start));
 
-        if let Ok(mut st) = shared.status.lock() {
-            st.phase = Phase::Idle;
-        }
+        set_phase_for_test(&shared, Phase::Optimized);
+        let (action, command) = shared.request_toggle();
+        assert_eq!(action, ToggleAction::Stop);
+        assert_eq!(command, Some(Command::Stop));
+
+        set_phase_for_test(&shared, Phase::Optimizing);
+        let (action, command) = shared.request_toggle();
+        assert_eq!(action, ToggleAction::Busy);
+        assert_eq!(command, None, "优化中不得投递任何命令");
+
         if let Ok(mut c) = shared.config.lock() {
             c.enabled = false;
         }
-        assert!(!shared.can_start(), "总开关关闭后不可开始");
+        set_phase_for_test(&shared, Phase::Idle);
+        let (action, command) = shared.request_toggle();
+        assert_eq!(action, ToggleAction::Disabled);
+        assert_eq!(command, None, "总开关关闭时不得投递任何命令");
+    }
+
+    /// 连续切换两个方向：Start → Stop，每次都有对应的命令，不会只剩 start。
+    #[test]
+    fn toggle_alternates_between_start_and_stop() {
+        let shared = Shared::new(Config::default());
+
+        let (first, _) = shared.request_toggle();
+        assert_eq!(first, ToggleAction::Start);
+
+        // 模拟后台跑完
+        set_phase_for_test(&shared, Phase::Optimized);
+
+        let (second, _) = shared.request_toggle();
+        assert_eq!(second, ToggleAction::Stop);
+
+        // 模拟还原完成
+        set_phase_for_test(&shared, Phase::Idle);
+
+        let (third, _) = shared.request_toggle();
+        assert_eq!(third, ToggleAction::Start, "还原后应能再次开始");
+    }
+
+    fn set_phase_for_test(shared: &Shared, phase: Phase) {
+        if let Ok(mut st) = shared.status.lock() {
+            st.phase = phase;
+        }
     }
 }

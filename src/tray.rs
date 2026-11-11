@@ -17,6 +17,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
 };
 
+use crate::app::ToggleAction;
+
 /// 托盘回调消息（WM_APP + 1）。
 pub const WM_TRAY: u32 = WM_APP + 1;
 
@@ -57,8 +59,10 @@ pub enum NotifyKind {
 pub enum Command {
     ToggleEnabled,
     ToggleAuto,
-    Start,
-    Stop,
+    /// 优化状态切换：未优化时开始、已优化时还原。
+    ///
+    /// 具体走哪个方向由 `app::Shared::toggle_action` 判定，不在菜单层判断。
+    ToggleRun,
     ToggleAutostart,
     ToggleHotkey,
     OpenConfig,
@@ -79,11 +83,11 @@ pub struct MenuState {
     pub enabled: bool,
     pub auto: bool,
     pub autostart: bool,
-    /// 已生效的优化（决定"停止优化"是否可用）
-    pub optimized: bool,
-    /// 全局快捷键开关（配置里的 `hotkey_enabled`）
+    /// 优化状态切换项：文案与可用性都取自同一个判定
+    pub toggle: ToggleAction,
+    /// 全局快捷键开关（已实际注册成功）
     pub hotkey_enabled: bool,
-    /// 快捷键文本：开关打开时是配置里的组合键，关闭时为空
+    /// 快捷键文本：注册成功时是组合键，否则回退到配置里的写法
     pub hotkey_label: String,
     /// 顶部状态文字
     pub status_line: String,
@@ -93,8 +97,9 @@ pub struct MenuState {
 
 const ID_TOGGLE_ENABLED: u32 = 1;
 const ID_TOGGLE_AUTO: u32 = 2;
-const ID_START: u32 = 3;
-const ID_STOP: u32 = 4;
+/// 优化状态切换项（开始/还原共用）。
+const ID_TOGGLE_RUN: u32 = 3;
+/// 原「立即开始优化」的 id，与切换项合并后不再使用；保留常量避免 id 复用冲突。
 const ID_TOGGLE_AUTOSTART: u32 = 5;
 const ID_OPEN_CONFIG: u32 = 6;
 const ID_QUIT: u32 = 7;
@@ -281,13 +286,15 @@ fn menu_str(menu: HMENU, flags: windows::Win32::UI::WindowsAndMessaging::MENU_IT
     }
 }
 
-/// 「立即开始优化」的菜单文字。
+/// 优化状态切换项的菜单文字。
 ///
-/// 菜单项没有原生 tooltip，快捷键按惯例用 `\t` 隔开、由系统右对齐显示。
-fn start_label(state: &MenuState) -> String {
+/// 文案取自 `ToggleAction::label`，与快捷键执行的动作是同一个判定；
+/// 快捷键按惯例用 `\t` 隔开、由系统右对齐显示。
+fn toggle_label(state: &MenuState) -> String {
+    let base = state.toggle.label();
     match (state.hotkey_enabled, state.hotkey_label.is_empty()) {
-        (true, false) => format!("立即开始优化\t{}", state.hotkey_label),
-        _ => "立即开始优化".to_string(),
+        (true, false) => format!("{base}\t{}", state.hotkey_label),
+        _ => base.to_string(),
     }
 }
 
@@ -323,21 +330,15 @@ fn build_menu(menu: HMENU, state: &MenuState) {
 
     menu_str(menu, MF_SEPARATOR, 0, "");
 
-    let start_flags = if !state.enabled || state.optimized {
-        MF_STRING | MF_GRAYED
-    } else {
-        MF_STRING
-    };
-    menu_str(menu, start_flags, ID_START, &start_label(state));
-
-    let stop_flags = if state.optimized {
+    // 开始与还原是同一个开关的两个方向，共用一个菜单项
+    let toggle_flags = if state.toggle.is_available() {
         MF_STRING
     } else {
         MF_STRING | MF_GRAYED
     };
-    menu_str(menu, stop_flags, ID_STOP, "停止优化并还原");
+    menu_str(menu, toggle_flags, ID_TOGGLE_RUN, &toggle_label(state));
 
-    // 快捷键开关与「立即开始优化」同属触发方式，紧挨着放
+    // 快捷键开关与切换项同属触发方式，紧挨着放
     menu_str(
         menu,
         MF_STRING | if state.hotkey_enabled { MF_CHECKED } else { MF_STRING },
@@ -370,12 +371,12 @@ fn build_menu(menu: HMENU, state: &MenuState) {
     menu_str(menu, MF_STRING, ID_QUIT, "退出 WGOpt");
 }
 
-fn translate_choice(id: u32) -> Option<MenuChoice> {    Some(match id {
+fn translate_choice(id: u32) -> Option<MenuChoice> {
+    Some(match id {
         0 => return None,
         ID_TOGGLE_ENABLED => MenuChoice::Command(Command::ToggleEnabled),
         ID_TOGGLE_AUTO => MenuChoice::Command(Command::ToggleAuto),
-        ID_START => MenuChoice::Command(Command::Start),
-        ID_STOP => MenuChoice::Command(Command::Stop),
+        ID_TOGGLE_RUN => MenuChoice::Command(Command::ToggleRun),
         ID_TOGGLE_AUTOSTART => MenuChoice::Command(Command::ToggleAutostart),
         ID_TOGGLE_HOTKEY => MenuChoice::Command(Command::ToggleHotkey),
         ID_OPEN_CONFIG => MenuChoice::Command(Command::OpenConfig),
@@ -420,12 +421,12 @@ fn set_text(buf: &mut [u16], text: &str) {
 mod tests {
     use super::*;
 
-    fn state(hotkey_enabled: bool, hotkey_label: &str) -> MenuState {
+    fn state(toggle: ToggleAction, hotkey_enabled: bool, hotkey_label: &str) -> MenuState {
         MenuState {
-            enabled: true,
+            enabled: !matches!(toggle, ToggleAction::Disabled),
             auto: true,
             autostart: false,
-            optimized: false,
+            toggle,
             hotkey_enabled,
             hotkey_label: hotkey_label.to_string(),
             status_line: "状态：待机".into(),
@@ -433,25 +434,63 @@ mod tests {
         }
     }
 
-    /// 快捷键开启时，开始项右侧带按键；关闭时只留菜单文字。
+    /// 快捷键开启时，切换项右侧带按键；关闭时只留菜单文字。
     #[test]
-    fn start_label_shows_hotkey_only_when_enabled() {
-        assert_eq!(start_label(&state(true, "Ctrl+F2")), "立即开始优化\tCtrl+F2");
-        assert_eq!(start_label(&state(false, "Ctrl+F2")), "立即开始优化");
+    fn toggle_label_shows_hotkey_only_when_enabled() {
+        assert_eq!(
+            toggle_label(&state(ToggleAction::Start, true, "Ctrl+F2")),
+            "立即开始优化\tCtrl+F2"
+        );
+        assert_eq!(
+            toggle_label(&state(ToggleAction::Start, false, "Ctrl+F2")),
+            "立即开始优化"
+        );
+    }
+
+    /// 已优化时同一个菜单项变成「停止优化并还原」，快捷键提示仍跟着走。
+    #[test]
+    fn toggle_label_follows_state() {
+        assert_eq!(
+            toggle_label(&state(ToggleAction::Stop, true, "Ctrl+F2")),
+            "停止优化并还原\tCtrl+F2"
+        );
+        assert_eq!(
+            toggle_label(&state(ToggleAction::Busy, true, "Ctrl+F2")),
+            "优化进行中…\tCtrl+F2"
+        );
+        assert_eq!(
+            toggle_label(&state(ToggleAction::Disabled, true, "Ctrl+F2")),
+            "立即开始优化\tCtrl+F2"
+        );
     }
 
     /// 配置里按键写坏时 `hotkey_label` 为空，不能显示出半截提示。
     #[test]
-    fn start_label_without_hotkey_text() {
-        assert_eq!(start_label(&state(true, "")), "立即开始优化");
+    fn toggle_label_without_hotkey_text() {
+        assert_eq!(toggle_label(&state(ToggleAction::Start, true, "")), "立即开始优化");
     }
 
     /// 开关关闭时仍展示按键，用户能看到重新打开会绑什么。
     #[test]
     fn hotkey_switch_label_keeps_key_hint() {
-        assert_eq!(hotkey_label(&state(true, "Ctrl+F2")), "启用快捷键（Ctrl+F2）");
-        assert_eq!(hotkey_label(&state(false, "Ctrl+F2")), "启用快捷键（Ctrl+F2）");
-        assert_eq!(hotkey_label(&state(true, "")), "启用快捷键");
+        assert_eq!(
+            hotkey_label(&state(ToggleAction::Start, true, "Ctrl+F2")),
+            "启用快捷键（Ctrl+F2）"
+        );
+        assert_eq!(
+            hotkey_label(&state(ToggleAction::Start, false, "Ctrl+F2")),
+            "启用快捷键（Ctrl+F2）"
+        );
+        assert_eq!(hotkey_label(&state(ToggleAction::Start, true, "")), "启用快捷键");
+    }
+
+    /// 只有 Start/Stop 可点；优化中与总开关关闭都灰掉。
+    #[test]
+    fn menu_item_grayed_when_not_available() {
+        assert!(ToggleAction::Start.is_available());
+        assert!(ToggleAction::Stop.is_available());
+        assert!(!ToggleAction::Busy.is_available());
+        assert!(!ToggleAction::Disabled.is_available());
     }
 
     /// 菜单项 id 决定点击后走哪条命令，改动时最容易漏掉映射。
@@ -461,5 +500,16 @@ mod tests {
             translate_choice(ID_TOGGLE_HOTKEY),
             Some(MenuChoice::Command(Command::ToggleHotkey))
         );
+    }
+
+    /// 切换项只有一个 id：开始与还原不再各占一个。
+    #[test]
+    fn run_toggle_uses_single_menu_id() {
+        assert_eq!(
+            translate_choice(ID_TOGGLE_RUN),
+            Some(MenuChoice::Command(Command::ToggleRun))
+        );
+        // 旧的 4（原「停止优化并还原」）不再映射到任何命令
+        assert_eq!(translate_choice(4), None);
     }
 }
