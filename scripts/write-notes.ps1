@@ -13,6 +13,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# here-string 里的反引号是转义符，写 3 个会被 PowerShell 吃成一个，
+# 生成出 `` 这种坏掉的 markdown 代码块。用单引号字符串拼出栅栏。
+$fence = '```'
+
 $content = @"
 ## WGOpt Core v$Version
 
@@ -44,11 +48,11 @@ WGOpt 的无界面版本：去掉了原版 Tauri 图形界面，改为系统托�
 
 ### 命令行
 
-```
+$fence
 wgopt --status          查看配置与权限
 wgopt --detect          一轮游戏识别 + 判定依据
 wgopt --optimize-once   跑一轮优化
-```
+$fence
 
 ### 实测
 
