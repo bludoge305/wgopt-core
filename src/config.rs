@@ -28,7 +28,7 @@ pub struct Config {
     pub notify_on_start: bool,
     /// 游戏退出、自动恢复时弹出系统通知
     pub notify_on_stop: bool,
-    /// 自动结束不可还原项（关闭的后台进程等），不会自动拉起
+    /// 程序退出时还原可还原项（进程优先级、服务、被关闭的 Wallpaper Engine）
     pub restore_on_exit: bool,
     /// 全局快捷键开关：关闭后不再注册快捷键
     pub hotkey_enabled: bool,

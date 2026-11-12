@@ -30,7 +30,7 @@ src/
   app.rs             后台守护：状态机、3s 轮询、自动优化/还原
   hotkey.rs          全局快捷键（RegisterHotKey）与编辑场景判定
   tray.rs            托盘图标、右键菜单、气泡通知
-  window.rs          不可见消息窗口（HWND_MESSAGE）与消息循环
+  window.rs          不可见消息窗口（WS_EX_TOOLWINDOW，非 message-only）与消息循环
   single_instance.rs 命名互斥体 + 事件
   logging.rs         文件日志（512 KB 滚动）
   elevate.rs         运行时 runas 提权
@@ -68,6 +68,18 @@ manifests`。提权走运行时 `ShellExecuteExW(runas)`，与原版一致。
 **编辑场景判定不要加浏览器类名黑名单。** 网页游戏的前台窗口就是
 `Chrome_RenderWidgetHostHWND` 这类通用窗口类，加进去会让网页游戏里按不了
 快捷键。这类场景靠 `hwndCaret` 判断即可。
+
+**消息窗口不能用 `HWND_MESSAGE`。** message-only 窗口收不到系统广播，
+Explorer 重启后的 `TaskbarCreated` 到不了，`reattach` 永远不触发，托盘图标
+在 Explorer 崩溃后一直缺失。窗口用 `WS_EX_TOOLWINDOW` + 永不 `Show`，
+效果一样不可见，但能收到广播。`TaskbarCreated` 的 ID 必须用
+`RegisterWindowMessageW` 取，不能写死（写死成 `0x001E` 实际是
+`WM_TIMECHANGE`）。
+
+**退出还原只走 `Shared::shutdown`。** 托盘「退出」只结束消息循环，还原与
+`restore_on_exit` 判定都在主线程收尾处做一次。判定依据是快照
+（`has_restorable_changes`），不是 `phase`：优化跑到一半退出时 phase 还没到
+「已优化」，但优先级、服务、Wallpaper Engine 已经改过了。
 
 ## Shell：必须用 PowerShell 7
 

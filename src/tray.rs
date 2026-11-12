@@ -18,6 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::app::ToggleAction;
+use crate::winapi::wide;
 
 /// 托盘回调消息（WM_APP + 1）。
 pub const WM_TRAY: u32 = WM_APP + 1;
@@ -107,17 +108,15 @@ const ID_TOGGLE_HOTKEY: u32 = 8;
 /// 优化项菜单 ID 基址，避免与上面的固定 ID 冲突。
 const MENU_ITEM_BASE: u32 = 100;
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
 /// 托盘对象：持有消息窗口句柄与图标资源。
 pub struct Tray {
     hwnd: HWND,
-    icon_dir: PathBuf,
     current: Option<TrayIcon>,
     last_tip: String,
     icons: Vec<(TrayIcon, HICON)>,
+    /// 图标当前是否真的挂在通知区域。add 失败或 Explorer 重启后为 false，
+    /// 下一次 update 会改用 NIM_ADD 重新注册。
+    attached: bool,
 }
 
 impl Tray {
@@ -131,10 +130,10 @@ impl Tray {
         }
         Self {
             hwnd,
-            icon_dir,
             current: None,
             last_tip: String::new(),
             icons,
+            attached: false,
         }
     }
 
@@ -179,18 +178,24 @@ impl Tray {
         data.uCallbackMessage = WM_TRAY;
         data.hIcon = self.icon_for(icon);
         set_text(&mut data.szTip, tip);
-        let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool();
+        self.attached = unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool();
         self.current = Some(icon);
         self.last_tip = tip.to_string();
-        ok
+        self.attached
     }
 
-    /// 更新图标与提示文字；两者都没变时跳过，避免托盘闪烁。
-    /// 返回是否真正写入了托盘。
-    pub fn update(&mut self, icon: TrayIcon, tip: &str) -> bool {
+    /// 更新图标与提示文字；两者都变时才写托盘，避免托盘闪烁。
+    ///
+    /// 图标没挂上时（首次 add 失败、Explorer 重启过）改用 `NIM_ADD` 重挂，
+    /// 否则 `NIM_MODIFY` 会一直失败，托盘永远不再出现。
+    pub fn update(&mut self, icon: TrayIcon, tip: &str) {
+        if !self.attached {
+            self.add(icon, tip);
+            return;
+        }
         let changed_icon = self.current != Some(icon);
         if !changed_icon && self.last_tip == tip {
-            return true;
+            return;
         }
         let mut data = self.base_data();
         data.uFlags = if changed_icon {
@@ -203,10 +208,14 @@ impl Tray {
             data.hIcon = self.icon_for(icon);
         }
         set_text(&mut data.szTip, tip);
-        let ok = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool();
-        self.current = Some(icon);
-        self.last_tip = tip.to_string();
-        ok
+        if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+            self.current = Some(icon);
+            self.last_tip = tip.to_string();
+        } else {
+            // 写失败说明图标已不在通知区域（典型是 Explorer 重启），
+            // 下一拍重挂
+            self.attached = false;
+        }
     }
 
     /// 弹出气泡通知。
@@ -226,17 +235,17 @@ impl Tray {
     }
 
     /// Explorer 重启后托盘图标会消失，重新注册一次。
+    ///
+    /// `NIM_ADD` 对同一 (hwnd, id) 是幂等的：Explorer 还活着时等于刷新，
+    /// 重启过则重新挂上。失败也不要紧，`update` 下一拍会再补。
     pub fn reattach(&mut self) {
         let icon = self.current.unwrap_or(TrayIcon::Idle);
-        let mut data = self.base_data();
-        data.uFlags = NIF_MESSAGE | NIF_ICON;
-        data.uCallbackMessage = WM_TRAY;
-        data.hIcon = self.icon_for(icon);
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_ADD, &data);
-        }
-        self.current = None;
-        self.last_tip.clear();
+        let tip = if self.last_tip.is_empty() {
+            "WGOpt".to_string()
+        } else {
+            self.last_tip.clone()
+        };
+        self.add(icon, &tip);
     }
 
     /// 弹出右键菜单并返回用户选择。
@@ -257,10 +266,6 @@ impl Tray {
             let _ = DestroyMenu(menu);
         }
         translate_choice(picked.0 as u32)
-    }
-
-    pub fn icon_dir(&self) -> &std::path::Path {
-        &self.icon_dir
     }
 }
 

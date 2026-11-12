@@ -75,10 +75,10 @@ fn timestamp() -> String {
     {
         use windows::Win32::System::SystemInformation::GetLocalTime;
         let t = unsafe { GetLocalTime() };
-        return format!(
+        format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
-        );
+        )
     }
     #[cfg(not(windows))]
     {

@@ -30,7 +30,6 @@ Unicode true
 !endif
 !ifndef OUTFILE
   !define OUTFILE "${SRCDIR}\target\release\bundle\WGOpt-Core-${VERSION}-x64-setup.exe"
-eleaseundle\WGOpt-Core-${VERSION}-x64-setup.exe"
 !endif
 
 !define PRODUCTNAME "WGOpt Core"
@@ -100,7 +99,7 @@ Function CheckNotInUse
     ${EndIf}
 
     MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION \
-      "WGOpt Core 正在运行，程序文件被占用，无法覆盖。$\r$\n$\r$\n请右键点击通知区域的 WGOpt 图标，选择「退出 WGOpt Core」，$\r$\n然后点击「重试」继续安装。" \
+      "WGOpt Core 正在运行，程序文件被占用，无法覆盖。$\r$\n$\r$\n请右键点击通知区域的 WGOpt 图标，选择「退出 WGOpt」，$\r$\n然后点击「重试」继续安装。" \
       IDRETRY CheckNotInUse_retry
     Abort
 
@@ -170,7 +169,7 @@ Section "Uninstall"
         ${ExitDo}
       ${EndIf}
       MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION \
-        "WGOpt Core 正在运行，无法删除。$\r$\n$\r$\n请右键点击通知区域的 WGOpt 图标，选择「退出 WGOpt Core」，$\r$\n然后点击「重试」。" \
+        "WGOpt Core 正在运行，无法删除。$\r$\n$\r$\n请右键点击通知区域的 WGOpt 图标，选择「退出 WGOpt」，$\r$\n然后点击「重试」。" \
         IDRETRY Uninstall_retry
       Abort
       Uninstall_retry:

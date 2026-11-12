@@ -63,8 +63,6 @@ pub struct Status {
     pub game: Option<GameCandidate>,
     /// 最近一轮各项结果
     pub results: Vec<ItemResult>,
-    /// 最近一次状态变化说明
-    pub message: String,
 }
 
 impl Default for Status {
@@ -74,7 +72,6 @@ impl Default for Status {
             enabled: true,
             game: None,
             results: Vec::new(),
-            message: String::new(),
         }
     }
 }
@@ -131,8 +128,6 @@ pub enum Command {
     Stop,
     /// 配置已改：立刻重新判定检测开关，不等下一个轮询周期
     ConfigChanged,
-    /// 退出：还原后结束进程
-    Shutdown,
 }
 
 /// 「优化状态切换」此刻能做什么。
@@ -179,7 +174,7 @@ pub struct Shared {
     /// 命令队列与唤醒信号
     commands: Mutex<VecDeque<Command>>,
     wake: Condvar,
-    /// 退出标志
+    /// 退出标志：主线程结束时置位，让守护线程不再投递新动作
     quit: std::sync::atomic::AtomicBool,
 }
 
@@ -247,10 +242,17 @@ impl Shared {
         self.status.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
-    fn set_phase(&self, phase: Phase, message: impl Into<String>) {
+    /// 快照里是否还有未还原的改动。
+    ///
+    /// 状态为「待机」不代表系统干净：优化跑到一半时关掉开关，phase 可能
+    /// 还没到「已优化」，但进程优先级、服务、Wallpaper Engine 已经动过了。
+    pub fn has_restorable_changes(&self) -> bool {
+        self.snapshot.lock().map(|s| !s.is_empty()).unwrap_or(false)
+    }
+
+    fn set_phase(&self, phase: Phase) {
         if let Ok(mut st) = self.status.lock() {
             st.phase = phase;
-            st.message = message.into();
         }
     }
 
@@ -302,9 +304,32 @@ impl Shared {
         self.quit.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn request_quit(&self) {
+    /// 通知守护线程停止工作。**不在这里还原**：还原统一由主线程在
+    /// 消息循环结束后按 [`Shared::shutdown`] 做一次，避免两个线程各还原
+    /// 一遍，把对方刚恢复的优先级再改回去。
+    pub fn request_quit(&self) {
         self.quit.store(true, std::sync::atomic::Ordering::SeqCst);
         self.wake.notify_all();
+    }
+
+    /// 程序退出前的收尾：按配置还原可还原项。
+    ///
+    /// 还原与否看快照而不是 `phase`：优化跑到一半退出时 phase 还没到
+    /// 「已优化」，但进程优先级、服务、Wallpaper Engine 已经动过了。
+    pub fn shutdown(&self) {
+        self.request_quit();
+        let restore = self
+            .config
+            .lock()
+            .map(|c| c.restore_on_exit)
+            .unwrap_or(true);
+        if !restore {
+            logging::info("restore_on_exit 已关闭，退出时不还原");
+            return;
+        }
+        if self.has_restorable_changes() {
+            restore_now(self, "程序退出，已自动恢复");
+        }
     }
 }
 
@@ -373,19 +398,7 @@ pub fn run_guardian(shared: Arc<Shared>) -> ! {
                     restore_now(&shared, "已手动停止优化，可还原项已恢复");
                 }
                 Command::ConfigChanged => recheck = true,
-                Command::Shutdown => {
-                    if shared.phase() == Phase::Optimized {
-                        restore_now(&shared, "程序退出，已自动恢复");
-                    }
-                    logging::info("收到退出命令，进程结束");
-                    shared.request_quit();
-                    exit_process();
-                }
             }
-        }
-
-        if shared.quit_requested() {
-            exit_process();
         }
 
         // 配置刚变过：把下一次轮询提前到现在，让开关立即生效
@@ -410,7 +423,13 @@ pub fn run_guardian(shared: Arc<Shared>) -> ! {
         // 总开关关闭：完全不检测，图标保持"已停用"
         if !enabled {
             if phase != Phase::Idle {
-                shared.set_phase(Phase::Idle, "总开关已关闭");
+                shared.set_phase(Phase::Idle);
+            }
+            // 关闭总开关必须还原已经动过的东西。不能只看 phase：优化跑到
+            // 一半被关掉时 phase 还没变成「已优化」，但优先级、服务、
+            // Wallpaper Engine 都已经改过了。以快照为准才不会漏还原。
+            if shared.has_restorable_changes() {
+                restore_now(&shared, "总开关已关闭，已恢复");
             }
             last_game_pid = None;
             exit_at = None;
@@ -441,9 +460,6 @@ pub fn run_guardian(shared: Arc<Shared>) -> ! {
             let mut cleared = false;
             if let Ok(mut st) = shared.status.lock() {
                 cleared = st.game.take().is_some();
-                if cleared {
-                    st.message = "自动优化已关闭，后台检测已停用".into();
-                }
             }
             if cleared {
                 logging::info("自动优化已关闭：已清除上一轮的游戏识别结果");
@@ -534,6 +550,9 @@ pub fn run_guardian(shared: Arc<Shared>) -> ! {
 
 /// 立即执行一轮优化（当前启用的所有项）。
 pub fn optimize_now(shared: &Shared, game: Option<String>) -> Vec<ItemResult> {
+    if shared.quit_requested() {
+        return Vec::new();
+    }
     if !shared.config.lock().map(|c| c.enabled).unwrap_or(true) {
         logging::info("总开关已关闭，忽略优化请求");
         return Vec::new();
@@ -548,16 +567,18 @@ pub fn optimize_now(shared: &Shared, game: Option<String>) -> Vec<ItemResult> {
             return Vec::new();
         }
         st.phase = Phase::Optimizing;
-        st.message = "正在优化".into();
     }
 
     let (ids, notify) = match shared.config.lock() {
         Ok(cfg) => (cfg.enabled_items.clone(), cfg.notify_on_start),
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            shared.set_phase(Phase::Idle);
+            return Vec::new();
+        }
     };
 
     if ids.is_empty() {
-        shared.set_phase(Phase::Idle, "没有启用任何优化项");
+        shared.set_phase(Phase::Idle);
         return Vec::new();
     }
 
@@ -565,7 +586,10 @@ pub fn optimize_now(shared: &Shared, game: Option<String>) -> Vec<ItemResult> {
     let results = {
         let mut snap = match shared.snapshot.lock() {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(_) => {
+                shared.set_phase(Phase::Idle);
+                return Vec::new();
+            }
         };
         // 每次全量优化前重置快照，避免同一 pid 重复累积。但「本程序关闭、
         // 尚未还原」的程序必须带过来：连续两轮优化之间没有经过 restore，
@@ -590,7 +614,6 @@ pub fn optimize_now(shared: &Shared, game: Option<String>) -> Vec<ItemResult> {
     if let Ok(mut st) = shared.status.lock() {
         st.phase = Phase::Optimized;
         st.results = results.clone();
-        st.message = format!("已完成 {done}/{total}");
     }
 
     if notify {
@@ -635,7 +658,6 @@ pub fn restore_now(shared: &Shared, reason: &str) -> Vec<String> {
     if let Ok(mut st) = shared.status.lock() {
         st.phase = Phase::Idle;
         st.results.clear();
-        st.message = reason.to_string();
     }
 
     if notify {
@@ -659,10 +681,6 @@ pub fn persist(shared: &Shared, mutate: impl FnOnce(&mut Config)) {
         logging::error(&format!("保存配置失败：{e}"));
     }
     shared.sync_enabled();
-}
-
-fn exit_process() -> ! {
-    std::process::exit(0)
 }
 
 #[cfg(test)]
@@ -718,6 +736,44 @@ mod tests {
         // 即使残留了"已优化"状态，关闭总开关也不该让还原变成可点
         set_phase_for_test(&shared, Phase::Optimized);
         assert_eq!(shared.toggle_action(), ToggleAction::Disabled);
+    }
+
+    /// 判断「是否还有东西要还原」必须看快照，不能看 phase。
+    ///
+    /// 优化跑到一半被关掉时 phase 还是「优化中」（甚至待机），但优先级、
+    /// 服务、Wallpaper Engine 已经动过了；按 phase 判断会漏还原。
+    #[test]
+    fn restorable_changes_are_detected_by_snapshot_not_phase() {
+        let shared = Shared::new(Config::default());
+        assert!(!shared.has_restorable_changes());
+
+        set_phase_for_test(&shared, Phase::Idle);
+        if let Ok(mut snap) = shared.snapshot.lock() {
+            snap.stopped_services.push("WSearch".into());
+        }
+        assert!(
+            shared.has_restorable_changes(),
+            "phase 是待机但快照非空，仍然要还原"
+        );
+    }
+
+    /// 快照只记录了「关闭的程序」时也算有东西要还原。
+    #[test]
+    fn killed_program_alone_counts_as_restorable() {
+        let shared = Shared::new(Config::default());
+        if let Ok(mut snap) = shared.snapshot.lock() {
+            snap.killed_programs.push(r"D:\WE\wallpaper64.exe".into());
+        }
+        assert!(shared.has_restorable_changes());
+    }
+
+    /// 优雅退出不得凭空造出还原：空快照时 shutdown 只置退出标志。
+    #[test]
+    fn shutdown_without_changes_sends_no_notification() {
+        let shared = Shared::new(Config::default());
+        shared.shutdown();
+        assert!(shared.quit_requested());
+        assert!(shared.drain_notifications().is_empty(), "没有改动就不该弹还原通知");
     }
 
     /// 判定与投递是同一个函数：返回的命令与判定必须一致，不可用的状态

@@ -23,14 +23,21 @@ use wgopt_core::tray::{Command as TrayCommand, MenuChoice, MenuState, NotifyKind
 use wgopt_core::window;
 
 fn main() {
-    // ---- 0. 管理员权限（与原版一致，运行时 runas 提权）----
-    wgopt_core::elevate::ensure_admin();
-
-    // ---- 0.5 诊断子命令：不常驻，执行完即退出 ----
+    // ---- 0. 诊断子命令：不常驻，执行完即退出 ----
+    // 必须在提权之前处理：`--version` / `--help` / `--status` 都是只读的，
+    // 为了看一眼版本弹 UAC 说不过去；而提权会重启进程，参数虽然透传，
+    // 但用户在 UAC 里点「取消」就什么也看不到。
+    // 只有真正动系统的子命令才需要管理员，见 [`cli_needs_admin`]。
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if cli_needs_admin(&args) {
+        wgopt_core::elevate::ensure_admin();
+    }
     if let Some(code) = run_cli(&args) {
         std::process::exit(code);
     }
+
+    // ---- 0.5 常驻模式：与原版一致，运行时 runas 提权 ----
+    wgopt_core::elevate::ensure_admin();
 
     // ---- 1. 单实例 ----
     let Some(_guard) = single_instance::acquire() else {
@@ -134,8 +141,16 @@ fn main() {
     let hotkey_cb = hotkey_binding.clone();
     let gate_cb = hotkey_gate.clone();
 
+    // 第二个实例通过这个命名事件请求弹菜单；每拍检查一次即可，
+    // 不必为它再起一个线程或引入 MsgWaitForMultipleObjects。
+    let show_event = single_instance::ShowEvent::open();
+
     window::run_message_loop(window::Callbacks {
         tick: Box::new(move || {
+            // 有人再次启动程序：把请求转成消息，走和托盘点击同一条菜单路径
+            if show_event.as_ref().map(|e| e.wait(0)).unwrap_or(false) {
+                window::post_show_menu();
+            }
             // 菜单弹出时 TrackPopupMenu 会跑自己的消息循环，期间 WM_TIMER
             // 仍会进来并占用 tray；此时跳过这一拍，下一拍再刷新。
             let Ok(mut guard) = tray_tick.try_borrow_mut() else {
@@ -176,14 +191,15 @@ fn main() {
     });
 
     // ---- 收尾 ----
-    logging::info("消息循环结束");
-    if shared.phase() == Phase::Optimized && shared.config.lock().map(|c| c.restore_on_exit).unwrap_or(true) {
-        app::restore_now(&shared, "程序退出，已自动恢复");
-    }
+    // 先摘掉托盘：还原里重启 Wallpaper Engine 要等好几秒，期间不能还挂着
+    // 一个「已优化」的图标。
     if let Ok(mut guard) = tray.try_borrow_mut() {
         *guard = None;
     }
-    logging::info("WGOpt 已退出");
+    logging::info("消息循环结束");
+    // 还原只在这里做一次：以快照为准（优化跑到一半退出也要还原），
+    // 并且遵守 restore_on_exit。托盘「退出」只负责结束消息循环。
+    shared.shutdown();
 }
 
 
@@ -196,16 +212,33 @@ fn attach_console() {
     }
 }
 
+/// 命令行开关一览。`run_cli` 与 [`cli_needs_admin`] 共用，避免两边漏掉同一个开关。
+const CLI_COMMANDS: &[&str] = &[
+    "--status",
+    "--detect",
+    "--optimize-once",
+    "--restore",
+    "--version",
+    "-v",
+    "--help",
+    "-h",
+];
+
+/// 该子命令是否需要管理员权限。
+///
+/// 只有 `--optimize-once` 真的会停服务、结束进程、改优先级。其余都是
+/// 只读查询或纯提示，为它们弹 UAC 只会让排障变麻烦。
+fn cli_needs_admin(args: &[String]) -> bool {
+    matches!(args.first().map(String::as_str), Some("--optimize-once"))
+}
+
 /// 处理命令行诊断子命令。返回 `Some(退出码)` 表示已处理完毕，无需常驻。
 ///
 /// 这些开关不参与后台常驻逻辑，只用于在终端里检查配置、识别结果与
 /// 单次优化的实际效果——后台程序没有界面，排障全靠它们。
 fn run_cli(args: &[String]) -> Option<i32> {
     let cmd = args.first()?.as_str();
-    if !matches!(
-        cmd,
-        "--status" | "--detect" | "--optimize-once" | "--restore" | "--version" | "--help" | "-h"
-    ) {
+    if !CLI_COMMANDS.contains(&cmd) {
         return None;
     }
 
@@ -257,7 +290,7 @@ fn print_help() {
     println!("  wgopt --status           显示配置与运行环境");
     println!("  wgopt --detect           执行一轮游戏识别并输出判定依据");
     println!("  wgopt --optimize-once    执行一轮优化（不常驻）");
-    println!("  wgopt --restore          还原优先级与服务（不常驻）");
+    println!("  wgopt --restore          说明还原入口（快照只在运行中的进程里）");
     println!("  wgopt --version          显示版本");
     println!();
     println!("配置与日志：{}", config::config_dir().display());
@@ -435,7 +468,8 @@ fn handle_choice(
         MenuChoice::Command(TrayCommand::ToggleHotkey) => toggle_hotkey(shared, binding),
         MenuChoice::Command(TrayCommand::OpenConfig) => open_config_dir(),
         MenuChoice::Command(TrayCommand::Quit) => {
-            shared.post_command(Command::Shutdown);
+            // 还原与退出统一由 main 的收尾段处理（shared.shutdown），
+            // 这里只结束消息循环，避免两个线程各还原一遍。
             window::post_quit();
         }
         MenuChoice::ToggleItem(idx) => toggle_item(shared, idx),
@@ -455,8 +489,10 @@ fn toggle_enabled(shared: &Shared) {
         NotifyKind::Info,
     );
 
-    // 关闭总开关时立刻还原已生效的改动，避免留下副作用
-    if !now && shared.phase() == Phase::Optimized {
+    // 关闭总开关时立刻还原已生效的改动，避免留下副作用。
+    // 判定看快照而非 phase：优化跑到一半时 phase 还不是「已优化」，
+    // 但优先级、服务、Wallpaper Engine 已经动过了。
+    if !now && shared.has_restorable_changes() {
         shared.post_command(Command::Stop);
     }
 }

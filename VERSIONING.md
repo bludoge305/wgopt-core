@@ -57,6 +57,7 @@ scripts\publish-release.cmd 1.0.1
 
 | 版本 | 类型 | 内容 |
 |---|---|---|
+| 1.1.2 | fix | 托盘与退出路径的一批修复：消息窗口不再用 `HWND_MESSAGE`（收不到 `TaskbarCreated`，Explorer 重启后托盘图标永久消失），广播消息 ID 改由 `RegisterWindowMessageW` 取；托盘图标挂载失败或丢失后自动重挂；关闭总开关/退出时按快照而非 `phase` 判定是否还原（优化中途关闭会漏还原）；退出还原收进 `Shared::shutdown` 一个入口（原先托盘退出绕过 `restore_on_exit`，且可能与守护线程重复还原）；第二实例唤起菜单真正生效（命名事件原先无人等待）；`--version` / `--help` / `--status` / `--detect` 不再要求管理员，`-v` 不再落进常驻模式；DNS 刷新改运行时 `GetProcAddress`，不再依赖 MinGW 的 `libdnsapi.a` |
 | 1.1.1 | fix | 「立即开始优化」与「停止优化并还原」合并为同一个状态切换项：菜单按状态显示对应文案、快捷键 `Ctrl+F2` 未优化时开始、已优化时还原；判定与投递统一收进 `Shared::toggle_action` / `request_toggle`，菜单、快捷键、灰化状态共用一份条件。优化进行中该项灰掉，快捷键同样不响应 |
 | 1.1.0 | feat | 新增全局快捷键（默认 `Ctrl+F2`）触发「立即开始优化」：`RegisterHotKey` 挂在消息窗口，托盘菜单新增开关，配置新增 `hotkey_enabled` / `hotkey`；带 `MOD_NOREPEAT` 与 1 秒闸门防重复触发，前台处于编辑场景（文本光标 / `Edit` 类控件 / 正在操作菜单）时忽略 |
 | 1.0.4 | fix | 修复停止优化后 Wallpaper Engine 不恢复：`background` 项（白名单含 WE）先结束进程、`wallpaper` 项随后查不到路径，快照里没有可还原记录。现在两项共用路径记录；还原只拉起一个主进程，已运行/手动恢复不重复启动，启动后立即退出如实报失败；连续两轮优化不再丢失待还原记录 |

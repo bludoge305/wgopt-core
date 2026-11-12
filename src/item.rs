@@ -79,16 +79,6 @@ pub enum Status {
     Fail,
 }
 
-impl Status {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Status::Done => "done",
-            Status::Skip => "skip",
-            Status::Fail => "fail",
-        }
-    }
-}
-
 /// 单项执行结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ItemResult {

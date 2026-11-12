@@ -200,8 +200,11 @@ pub fn classify_window(w: i32, h: i32, screen_w: i32, screen_h: i32) -> WindowKi
     WindowKind::Small
 }
 
-/// 枚举所有可见的顶层窗口，返回 (pid, 标题, 宽, 高)。
-pub fn list_visible_windows() -> Vec<(u32, String, i32, i32)> {
+/// 一个可见窗口：(pid, 标题, 宽, 高)。
+type VisibleWindow = (u32, String, i32, i32);
+
+/// 枚举所有可见的顶层窗口。
+pub fn list_visible_windows() -> Vec<VisibleWindow> {
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -211,7 +214,7 @@ pub fn list_visible_windows() -> Vec<(u32, String, i32, i32)> {
 
     // EnumWindows 是同步回调，结果收集用线程局部存储，避免 static mut 的别名风险
     thread_local! {
-        static OUT: std::cell::RefCell<Option<Vec<(u32, String, i32, i32)>>> =
+        static OUT: std::cell::RefCell<Option<Vec<VisibleWindow>>> =
             const { std::cell::RefCell::new(None) };
     }
 
@@ -267,13 +270,19 @@ pub struct CpuSampler {
     instant: std::time::Instant,
 }
 
-impl CpuSampler {
-    pub fn new() -> Self {
+impl Default for CpuSampler {
+    fn default() -> Self {
         Self {
             samples: Vec::new(),
             cores: num_cores(),
             instant: std::time::Instant::now(),
         }
+    }
+}
+
+impl CpuSampler {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// 采集一轮，返回 (pid, CPU 百分比) 列表。
@@ -508,21 +517,11 @@ pub fn rank_candidates(
         }
     }
 
-    out.sort_by(|a, b| b.score.cmp(&a.score));
+    out.sort_by_key(|c| std::cmp::Reverse(c.score));
     out.retain(|c| c.score >= THRESHOLD);
     out
 }
 
-/// 仅用于调试：返回所有候选的评分，便于排查误判/漏判。
-pub fn score_all(
-    cpu_usage: &[(u32, f32)],
-    gpu_usage: &std::collections::HashMap<u32, f32>,
-) -> Vec<GameCandidate> {
-    let mut all = rank_candidates(cpu_usage, gpu_usage);
-    // 调试视图还要看到未达阈值的项，因此重新收集一遍低分候选
-    all.sort_by(|a, b| b.score.cmp(&a.score));
-    all
-}
 impl GameCandidate {
     /// 展示用名称：优先窗口标题，没有标题时退回进程名。
     pub fn label(&self) -> String {

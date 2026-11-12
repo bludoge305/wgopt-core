@@ -3,6 +3,7 @@
 //! 原样沿用 WGOpt 桌面版的实现，只去掉界面需要的展示字段。
 //! 所有对外函数返回 `Result<_, String>`，错误信息为可直接展示的中文。
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 
@@ -22,24 +23,43 @@ use windows::Win32::System::Services::{
 };
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetPriorityClass, OpenProcess, SetPriorityClass, TerminateProcess,
-    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
-    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetCurrentProcessId, GetPriorityClass, OpenProcess, OpenProcessToken,
+    SetPriorityClass, TerminateProcess, ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS,
+    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, PROCESS_VM_READ,
     REALTIME_PRIORITY_CLASS,
 };
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
-use windows::Win32::System::Threading::{GetCurrentProcessId, OpenProcessToken};
 
-// 直接链接 dnsapi.dll 刷新 DNS 缓存。
-// windows crate 0.62 未导出该函数，这里手动声明。
-#[link(name = "dnsapi")]
-extern "system" {
-    fn DnsFlushResolverCache() -> u32;
+// 刷新 DNS 缓存：`windows` crate 0.62 没有导出 `DnsFlushResolverCache`
+// （win32metadata 里缺这一条），只能自己去 dnsapi.dll 取。
+//
+// 这里走运行时 `GetProcAddress` 而不是 `#[link(name = "dnsapi")]`：后者要求
+// 链接器能找到 `libdnsapi.a`，而 MinGW 发行版未必都带（本机就没有），
+// 于是「装好 Rust 就能编」变成「还得凑齐导入库」。`dnsapi.dll` 是系统
+// 自带的，取地址不会失败。
+fn dns_flush_resolver_cache() -> Option<unsafe extern "system" fn() -> u32> {
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+
+    unsafe {
+        // dnsapi.dll 未必已经加载进本进程（只有解析过 DNS 的进程才有），
+        // 所以先用 GetModuleHandle 探一下，拿不到就 LoadLibrary。
+        // 句柄故意不释放：进程退出时系统会回收，这里也省得处理
+        // 「释放后函数指针又活了一会儿」的问题。
+        let lib = GetModuleHandleW(windows::core::w!("dnsapi.dll"))
+            .or_else(|_| LoadLibraryW(windows::core::w!("dnsapi.dll")))
+            .ok()?;
+        let proc = GetProcAddress(lib, windows::core::s!("DnsFlushResolverCache"))?;
+        // FARPROC 是泛型函数指针，转成具体的 DnsFlushResolverCache 签名
+        Some(std::mem::transmute::<
+            unsafe extern "system" fn() -> isize,
+            unsafe extern "system" fn() -> u32,
+        >(proc))
+    }
 }
 
 /// 将 Rust 字符串转成以 NUL 结尾的宽字符串。
-fn wide(s: &str) -> Vec<u16> {
+pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -115,46 +135,6 @@ pub fn priority_class(name: &str) -> Option<windows::Win32::System::Threading::P
     })
 }
 
-/// 枚举所有进程（含内存/线程/句柄统计）。
-pub fn list_processes() -> Vec<ProcessInfo> {
-    let raw = process_snapshot_raw();
-    // 先建 pid -> 名称 映射，供父进程名解析（父进程可能不在列表中）
-    let name_map: Vec<(u32, String)> = raw.iter().map(|(p, _, n)| (*p, n.clone())).collect();
-    // 线程数一次性统计，避免逐进程重建全系统快照
-    let thread_map = all_thread_counts();
-
-    raw.iter()
-        .map(|(pid, parent_pid, name)| {
-            let (working_set, handle_count) = process_stats(*pid);
-            let thread_count = thread_map
-                .iter()
-                .find(|(p, _)| p == pid)
-                .map(|(_, c)| *c)
-                .unwrap_or(0);
-            ProcessInfo {
-                pid: *pid,
-                name: name.clone(),
-                working_set,
-                thread_count,
-                handle_count,
-                parent_name: name_map
-                    .iter()
-                    .find(|(p, _)| p == parent_pid)
-                    .map(|(_, n)| n.clone()),
-            }
-        })
-        .collect()
-}
-
-/// 轻量版进程列表：只取 pid 与名称，不做句柄/内存查询。
-/// 用于高频轮询场景，避免反复打开每个进程的句柄。
-pub fn list_processes_basic() -> Vec<(u32, String)> {
-    process_snapshot_raw()
-        .into_iter()
-        .map(|(pid, _, name)| (pid, name))
-        .collect()
-}
-
 /// 所有进程的 (pid, 父 pid) 映射，用于构建父子链。
 pub fn process_parents() -> Vec<(u32, u32)> {
     process_snapshot_raw()
@@ -163,16 +143,19 @@ pub fn process_parents() -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// 只统计指定 PID 的详细信息。
-///
-/// 高频检测时先用 `list_processes_basic` 粗筛，再对少量候选调用本函数。
-/// 线程统计通过 `thread_counts_for` 单独完成（它会扫描全系统线程表，
-/// 是主要耗时来源），因此调用方应尽量复用其结果。
-pub fn list_processes_subset(pids: &[u32]) -> Vec<ProcessInfo> {
-    list_processes_subset_with_threads(pids, &thread_counts_for(pids))
+/// 轻量版进程列表：只取 pid 与名称，不做句柄/内存查询。
+/// 用于高频轮询与批量结束进程，避免反复打开每个进程的句柄。
+pub fn list_processes_basic() -> Vec<(u32, String)> {
+    process_snapshot_raw()
+        .into_iter()
+        .map(|(pid, _, name)| (pid, name))
+        .collect()
 }
 
-/// 与 `list_processes_subset` 相同，但线程数由调用方提供，便于复用一次扫描结果。
+/// 枚举指定进程的详细信息（工作集、线程数、句柄数、父进程名）。
+///
+/// 只查调用方给的少量候选：每个 pid 都要开句柄、读内存计数，
+/// 全量枚举没有调用者，也不需要。
 pub fn list_processes_subset_with_threads(
     pids: &[u32],
     thread_map: &[(u32, u32)],
@@ -181,64 +164,24 @@ pub fn list_processes_subset_with_threads(
         return Vec::new();
     }
     let raw = process_snapshot_raw();
-    let name_map: Vec<(u32, String)> = raw.iter().map(|(p, _, n)| (*p, n.clone())).collect();
+    let names: HashMap<u32, String> = raw.iter().map(|(p, _, n)| (*p, n.clone())).collect();
+    let parents: HashMap<u32, u32> = raw.iter().map(|(p, pp, _)| (*p, *pp)).collect();
+    let threads: HashMap<u32, u32> = thread_map.iter().copied().collect();
 
     pids.iter()
         .filter_map(|pid| {
-            let (_, parent_pid, name) = raw.iter().find(|(p, _, _)| p == pid)?;
+            let name = names.get(pid)?.clone();
             let (working_set, handle_count) = process_stats(*pid);
-            let thread_count = thread_map
-                .iter()
-                .find(|(p, _)| p == pid)
-                .map(|(_, c)| *c)
-                .unwrap_or(0);
             Some(ProcessInfo {
                 pid: *pid,
-                name: name.clone(),
+                name,
                 working_set,
-                thread_count,
+                thread_count: threads.get(pid).copied().unwrap_or(0),
                 handle_count,
-                parent_name: name_map
-                    .iter()
-                    .find(|(p, _)| p == parent_pid)
-                    .map(|(_, n)| n.clone()),
+                parent_name: parents.get(pid).and_then(|pp| names.get(pp)).cloned(),
             })
         })
         .collect()
-}
-
-/// 只统计给定 PID 的线程数（仍需一次全表扫描，但结果只保留关心的项）。
-fn thread_counts_for(pids: &[u32]) -> Vec<(u32, u32)> {
-    use std::collections::{HashMap, HashSet};
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
-
-    let wanted: HashSet<u32> = pids.iter().copied().collect();
-    let mut counts: HashMap<u32, u32> = HashMap::new();
-
-    unsafe {
-        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) else {
-            return Vec::new();
-        };
-        let mut entry = THREADENTRY32 {
-            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-            ..Default::default()
-        };
-        if Thread32First(snapshot, &mut entry).is_ok() {
-            loop {
-                let owner = entry.th32OwnerProcessID;
-                if wanted.contains(&owner) {
-                    *counts.entry(owner).or_insert(0) += 1;
-                }
-                if Thread32Next(snapshot, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = CloseHandle(snapshot);
-    }
-    counts.into_iter().collect()
 }
 
 /// 原始进程快照：(pid, 父 pid, 进程名)。
@@ -308,13 +251,14 @@ fn process_stats(pid: u32) -> (u64, u32) {
 /// 逐进程查询会为每个进程重建全系统快照（O(n²)），进程多时开销明显，
 /// 因此改为一次性统计。
 pub fn all_thread_counts() -> Vec<(u32, u32)> {
+    use std::collections::HashMap;
     use windows::Win32::System::Diagnostics::ToolHelp::{
         Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
-    let mut result: Vec<(u32, u32)> = Vec::new();
+    let mut counts: HashMap<u32, u32> = HashMap::new();
     unsafe {
         let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) else {
-            return result;
+            return Vec::new();
         };
         let mut entry = THREADENTRY32 {
             dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
@@ -322,11 +266,7 @@ pub fn all_thread_counts() -> Vec<(u32, u32)> {
         };
         if Thread32First(snapshot, &mut entry).is_ok() {
             loop {
-                let owner = entry.th32OwnerProcessID;
-                match result.iter_mut().find(|(p, _)| *p == owner) {
-                    Some((_, c)) => *c += 1,
-                    None => result.push((owner, 1)),
-                }
+                *counts.entry(entry.th32OwnerProcessID).or_insert(0) += 1;
                 if Thread32Next(snapshot, &mut entry).is_err() {
                     break;
                 }
@@ -334,7 +274,7 @@ pub fn all_thread_counts() -> Vec<(u32, u32)> {
         }
         let _ = CloseHandle(snapshot);
     }
-    result
+    counts.into_iter().collect()
 }
 
 /// 进程累计 CPU 时间（毫秒），失败返回 None。
@@ -480,13 +420,12 @@ pub fn trim_all_working_sets() -> (u64, u32, u32) {
     let mut trimmed = 0u32;
     let mut failed = 0u32;
 
-    for p in list_processes() {
-        if p.working_set == 0 {
-            continue;
-        }
+    // 只需要 pid：工作集会在 EmptyWorkingSet 之后由系统重算，
+    // 事先查一遍是白花一次全量进程统计。
+    for (pid, _) in list_processes_basic() {
         unsafe {
             let Ok(handle) =
-                OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION, false, p.pid)
+                OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
             else {
                 failed += 1;
                 continue;
@@ -595,10 +534,8 @@ pub fn stop_service(name: &str) -> Result<bool, String> {
         }
 
         let mut status = SERVICE_STATUS::default();
-        let res = ControlService(svc, SERVICE_CONTROL_STOP_CODE, &mut status);
-
-        if res.is_err() {
-            let code = res.unwrap_err().code().0;
+        if let Err(e) = ControlService(svc, SERVICE_CONTROL_STOP_CODE, &mut status) {
+            let code = e.code().0;
             let _ = CloseServiceHandle(svc);
             let _ = CloseServiceHandle(scm);
             return Err(format!("停止服务 {name} 失败：{}", service_error_text(code)));
@@ -720,12 +657,14 @@ pub fn clear_clipboard() -> Result<(), String> {
 
 /// 刷新 DNS 解析缓存。
 pub fn flush_dns() -> Result<(), String> {
-    unsafe {
-        if DnsFlushResolverCache() != 0 {
-            Ok(())
-        } else {
-            Err("刷新 DNS 缓存失败".into())
-        }
+    let Some(flush) = dns_flush_resolver_cache() else {
+        return Err("找不到 dnsapi.dll 的刷新接口".into());
+    };
+    // 返回非零表示成功（与原版一致）
+    if unsafe { flush() } != 0 {
+        Ok(())
+    } else {
+        Err("刷新 DNS 缓存失败".into())
     }
 }
 

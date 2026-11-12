@@ -42,9 +42,6 @@ pub use snapshot::Snapshot;
 /// 程序版本，与 Cargo.toml 保持一致。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 程序显示名。
-pub const APP_NAME: &str = "WGOpt";
-
 /// 读取全部优化项定义。
 pub fn item_definitions() -> Vec<OptimizeItem> {
     item::item_definitions()

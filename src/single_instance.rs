@@ -10,12 +10,10 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::Threading::{CreateEventW, CreateMutexW, SetEvent, WaitForSingleObject};
 
+use crate::winapi::wide;
+
 const MUTEX_NAME: &str = r"Local\WGOpt.Core.Mutex";
 const SHOW_EVENT_NAME: &str = r"Local\WGOpt.Core.ShowMenu";
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
 
 /// 单实例守卫：持有互斥体句柄直到进程退出。
 pub struct SingleInstance {
@@ -40,6 +38,34 @@ pub fn acquire() -> Option<SingleInstance> {
     }
 }
 
+/// 持有「请弹菜单」事件，供消息循环线程等待。
+///
+/// 首实例必须在启动时创建这个事件：第二个实例靠 `SetEvent` 通知它弹菜单。
+/// 之前只在 `signal_existing` 里临时 `CreateEventW` 再立刻关掉，首实例
+/// 从来没等过它，所以「再次启动程序会弹出已有实例的菜单」一直没生效。
+pub struct ShowEvent(HANDLE);
+
+impl ShowEvent {
+    pub fn open() -> Option<Self> {
+        let name = wide(SHOW_EVENT_NAME);
+        // 自动复位事件：一次 SetEvent 只唤醒一次等待
+        unsafe { CreateEventW(None, false, false, PCWSTR(name.as_ptr())).ok().map(Self) }
+    }
+
+    /// 等最多 `timeout_ms` 毫秒；被通知返回 true。
+    pub fn wait(&self, timeout_ms: u32) -> bool {
+        unsafe { WaitForSingleObject(self.0, timeout_ms) == WAIT_OBJECT_0 }
+    }
+}
+
+impl Drop for ShowEvent {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 /// 通知已运行的实例弹出菜单。
 fn signal_existing() {
     let name = wide(SHOW_EVENT_NAME);
@@ -49,17 +75,4 @@ fn signal_existing() {
             let _ = CloseHandle(event);
         }
     }
-}
-
-/// 打开（或创建）用于接收"请弹菜单"信号的事件。
-pub fn open_show_event() -> Option<HANDLE> {
-    let name = wide(SHOW_EVENT_NAME);
-    unsafe {
-        CreateEventW(None, false, false, PCWSTR(name.as_ptr())).ok()
-    }
-}
-
-/// 非阻塞地检查事件是否被触发。
-pub fn show_event_signaled(event: HANDLE) -> bool {
-    unsafe { WaitForSingleObject(event, 0) == WAIT_OBJECT_0 }
 }

@@ -100,13 +100,15 @@ fn skip_relaunch(running: &[String], target: &str) -> bool {
 }
 
 /// 进程是否出现在进程表里。
-fn process_seen(name: &str, wallpaper_ok: bool) -> bool {
+///
+/// 每次调用都重新枚举一次进程表——`confirm_started` 要的就是「此刻在不在」
+/// 的新鲜数据，没法复用上一次的结果。
+fn process_seen(name: &str) -> bool {
     let running: Vec<String> = winapi::list_processes_basic()
         .into_iter()
         .map(|(_, n)| n)
         .collect();
-    running.iter().any(|n| n.eq_ignore_ascii_case(name))
-        || (wallpaper_ok && any_wallpaper_main_running(&running))
+    skip_relaunch(&running, name)
 }
 
 /// 启动后确认进程确实活下来了，而不是建出来就退出。
@@ -131,20 +133,20 @@ fn confirm_started(name: &str) -> bool {
 
     std::thread::sleep(SETTLE_BEFORE_CHECK);
 
-    let mut seen = process_seen(name, wallpaper);
+    let mut seen = process_seen(name);
     for _ in 0..polls {
         if seen {
             break;
         }
         std::thread::sleep(POLL);
-        seen = process_seen(name, wallpaper);
+        seen = process_seen(name);
     }
     if !seen {
         return false;
     }
 
     std::thread::sleep(CONFIRM_AGAIN);
-    process_seen(name, wallpaper)
+    process_seen(name)
 }
 
 // ---------------------------------------------------------------- 各项优化
@@ -219,38 +221,40 @@ pub fn optimize_background(game_name: Option<&str>, snapshot: &mut Snapshot) -> 
     let mut killed: Vec<String> = Vec::new();
     let mut denied: Vec<String> = Vec::new();
 
-    for p in winapi::list_processes() {
-        if whitelist::is_protected(&p.name) {
+    // 只需要 pid 与名称：结束进程不需要工作集/句柄数，
+    // 用轻量枚举省掉对每个进程的句柄查询
+    for (pid, name) in winapi::list_processes_basic() {
+        if whitelist::is_protected(&name) {
             continue;
         }
         // 不结束游戏自身
         if let Some(g) = game_name {
-            if p.name.eq_ignore_ascii_case(g) {
+            if name.eq_ignore_ascii_case(g) {
                 continue;
             }
         }
-        if !whitelist::in_background_whitelist(&p.name) {
+        if !whitelist::in_background_whitelist(&name) {
             continue;
         }
 
         // 必须在结束之前取路径：进程没了就查不到，还原时无从启动
-        let is_wallpaper = is_wallpaper_process(&p.name);
+        let is_wallpaper = is_wallpaper_process(&name);
         let path = if is_wallpaper {
-            winapi::process_image_path(p.pid)
+            winapi::process_image_path(pid)
         } else {
             String::new()
         };
 
-        match winapi::terminate_process(p.pid) {
+        match winapi::terminate_process(pid) {
             Ok(_) => {
-                record_killed_program(snapshot, &p.name, &path);
-                if !killed.iter().any(|k| k.eq_ignore_ascii_case(&p.name)) {
-                    killed.push(p.name.clone());
+                record_killed_program(snapshot, &name, &path);
+                if !killed.iter().any(|k| k.eq_ignore_ascii_case(&name)) {
+                    killed.push(name.clone());
                 }
             }
             Err(_) => {
-                if !denied.iter().any(|k| k.eq_ignore_ascii_case(&p.name)) {
-                    denied.push(p.name.clone());
+                if !denied.iter().any(|k| k.eq_ignore_ascii_case(&name)) {
+                    denied.push(name.clone());
                 }
             }
         }
@@ -329,16 +333,17 @@ pub fn optimize_wallpaper(snapshot: &mut Snapshot) -> ItemResult {
     let started = std::time::Instant::now();
     let mut killed = Vec::new();
 
-    for p in winapi::list_processes() {
-        if !is_wallpaper_process(&p.name) {
+    // 同样只需要 pid 与名称
+    for (pid, name) in winapi::list_processes_basic() {
+        if !is_wallpaper_process(&name) {
             continue;
         }
         // 先取路径再结束：进程没了就查不到路径，还原时无从启动
-        let path = winapi::process_image_path(p.pid);
-        if winapi::terminate_process(p.pid).is_ok() {
-            record_killed_program(snapshot, &p.name, &path);
-            if !killed.iter().any(|k: &String| k.eq_ignore_ascii_case(&p.name)) {
-                killed.push(p.name.clone());
+        let path = winapi::process_image_path(pid);
+        if winapi::terminate_process(pid).is_ok() {
+            record_killed_program(snapshot, &name, &path);
+            if !killed.iter().any(|k: &String| k.eq_ignore_ascii_case(&name)) {
+                killed.push(name.clone());
             }
         }
     }

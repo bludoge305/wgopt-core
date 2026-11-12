@@ -1,26 +1,30 @@
 //! 不可见消息窗口：托盘事件的接收方与定时心跳。
 //!
 //! 没有界面后，托盘仍要求有一个 HWND 接收 `Shell_NotifyIconW` 的回调。
-//! 这里创建一个 `HWND_MESSAGE` 子窗口——它不参与绘制，也不会出现在
-//! 任务栏或 Alt+Tab 里。
+//! 这里创建一个带 `WS_EX_TOOLWINDOW`、从不 Show 的普通顶层窗口——它不
+//! 参与绘制，也不会出现在任务栏或 Alt+Tab 里。
+//!
+//! 不能用 `HWND_MESSAGE`（message-only）窗口：它收不到系统广播，
+//! Explorer 重启后的 `TaskbarCreated` 到不了，托盘图标会一直缺失。
 //!
 //! 主循环结构：`SetTimer` 每 200 ms 触发一次 `WM_TIMER`，在窗口过程里
 //! 消费共享状态并刷新托盘。所有 UI 操作都发生在同一个线程上，因此不
 //! 需要跨线程的消息投递。
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW, PostQuitMessage,
-    RegisterClassW, SetTimer, TranslateMessage, HMENU, HWND_MESSAGE, MSG, WINDOW_EX_STYLE,
-    WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetMessageW, PostMessageW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetTimer, TranslateMessage, HMENU, MSG,
+    WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
 use crate::logging;
 use crate::tray::WM_TRAY;
+use crate::winapi::wide;
 
 /// 跨线程请求自定义消息（`WM_APP + 2`）。
 pub const WM_WGOPT_REQUEST: u32 = WM_APP + 2;
@@ -28,15 +32,24 @@ pub const WM_WGOPT_REQUEST: u32 = WM_APP + 2;
 const TIMER_ID: usize = 1;
 /// 心跳间隔：足够快，又不空转 CPU。
 const TIMER_MS: u32 = 200;
+
 /// Explorer 重启后广播的消息。
-const WM_TASKBARCREATED: u32 = 0x0000_001E;
+///
+/// 这个 ID 由 `RegisterWindowMessageW("TaskbarCreated")` 动态分配，不能写死。
+/// 之前写死成 `0x001E` 恰好是 `WM_TIMECHANGE`，于是「Explorer 重启后重新
+/// 注册托盘」永远不会触发，只有改系统时间时才误触发一次。
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+
+fn taskbar_created_message() -> u32 {
+    TASKBAR_CREATED.load(Ordering::SeqCst)
+}
 
 static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// 共享的消息窗口句柄。
 pub fn main_hwnd() -> Option<HWND> {
     let v = MAIN_HWND.load(Ordering::SeqCst);
-    (v != 0).then(|| HWND(v as *mut _))
+    (v != 0).then_some(HWND(v as *mut _))
 }
 
 /// 窗口过程回调集合。
@@ -96,7 +109,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
-            WM_TASKBARCREATED => {
+            // 广播消息：Explorer 重启（或首次就绪）后重新注册托盘图标
+            m if m != 0 && m == taskbar_created_message() => {
                 if let Some(cb) = &mut *std::ptr::addr_of_mut!(CALLBACKS) {
                     (cb.reattach)();
                 }
@@ -114,8 +128,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 /// 创建消息窗口但不启动循环。
 ///
 /// 返回句柄后调用方可以先注册托盘图标，再调用 [`run_message_loop`]。
+///
+/// 窗口必须是**普通顶层窗口**（只是从不 Show），不能用 `HWND_MESSAGE`：
+/// message-only 窗口收不到系统广播，Explorer 重启后发的 `TaskbarCreated`
+/// 就到不了这里，托盘图标会一直缺失到下次启动。
 pub fn create_message_window() -> Result<HWND, String> {
     let class_name = wide("WGOptCoreMessageWindow");
+
+    // Explorer 重启广播的消息 ID：必须注册后才拿到真实值。
+    // 注册失败时保持 0，窗口过程里 `m != 0` 的判断会跳过。
+    let taskbar_msg = unsafe { RegisterWindowMessageW(PCWSTR(wide("TaskbarCreated").as_ptr())) };
+    TASKBAR_CREATED.store(taskbar_msg, Ordering::SeqCst);
 
     unsafe {
         let instance = GetModuleHandleW(None).map_err(|e| format!("获取模块句柄失败：{e}"))?;
@@ -131,8 +154,10 @@ pub fn create_message_window() -> Result<HWND, String> {
         }
 
         let title = wide("WGOpt");
+        // 不创建为 message-only 窗口（理由见函数注释）。加上 WS_EX_TOOLWINDOW
+        // 保证它永远不进任务栏与 Alt+Tab，即使将来被误 Show 也一样。
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            WS_EX_TOOLWINDOW,
             PCWSTR(class_name.as_ptr()),
             PCWSTR(title.as_ptr()),
             WS_OVERLAPPED,
@@ -140,7 +165,7 @@ pub fn create_message_window() -> Result<HWND, String> {
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            None,
             None::<HMENU>,
             Some(instance.into()),
             None,
@@ -180,7 +205,13 @@ pub fn run_message_loop(callbacks: Callbacks) {
 
 /// 请求主线程弹菜单（供外部实例唤起已有进程时使用）。
 pub fn post_show_menu() {
-    if let Some(hwnd) = main_hwnd() {
+    let hwnd = main_hwnd().or_else(|| unsafe {
+        // 另一个进程刚启动时 main_hwnd() 还没赋值：按窗口类名找一次。
+        // 第二个实例走的就是这条路径。
+        let class = wide("WGOptCoreMessageWindow");
+        FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()).ok()
+    });
+    if let Some(hwnd) = hwnd {
         unsafe {
             let _ = PostMessageW(Some(hwnd), WM_WGOPT_REQUEST, WPARAM(0), LPARAM(0));
         }
@@ -196,6 +227,3 @@ pub fn post_quit() {
     }
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}

@@ -139,7 +139,17 @@ wgopt --restore           # 说明还原入口（快照只存在于运行中的�
 wgopt --version
 ```
 
+除 `--optimize-once` 外都不需要管理员权限，不会弹 UAC。`--optimize-once` 要停服务、
+结束进程、改优先级，所以会先提权。
+
 日志在 `%APPDATA%\WGOpt\wgopt.log`，单文件上限 512 KB 自动滚动。
+
+## 退出与还原
+
+还原依据的是快照，不是界面上的状态：优化跑到一半时关掉总开关、或者直接退出程序，
+已经改过的进程优先级、服务、Wallpaper Engine 一样会被还原。托盘「退出」与窗口
+关闭走同一条收尾路径，不会出现只还原一半的情况。`restore_on_exit` 为 `false`
+时退出不还原。
 
 ## 验证 Wallpaper Engine 还原
 
