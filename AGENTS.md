@@ -116,9 +116,17 @@ Explorer 重启后的 `TaskbarCreated` 到不了，`reattach` 永远不触发，
 ## 构建与运行
 
 ```bat
-deploy.cmd            :: 编译 exe，把 assets\tray\*.ico 拷到 target\release\tray\
-build-installer.cmd   :: 用 NSIS 打安装包
+scripts\fetch-toolchain.cmd   :: 下载 MinGW-w64 到 .toolchain\（首次或换机器时）
+deploy.cmd                    :: 编译 exe，把 assets\tray\*.ico 拷到 target\release\tray\
+build-installer.cmd           :: 用 NSIS 打安装包
 ```
+
+**工具链不进仓库。** 完整 MinGW-w64 约 500 MB / 11k 文件，提交进去会让每次
+clone 都拉几百 MB。用 `scripts\fetch-toolchain.cmd` 按需下载到 `.toolchain\`
+（已 gitignore），版本固定在脚本顶部的 `WL_VER` / `WL_FILE`：
+winlibs `gcc-16.2.0 / mingw-w64ucrt 14.0.0 / posix / SEH`。
+手动 `cargo build` 前先 `call scripts\use-toolchain.cmd` 把工具链挂到 PATH；
+`deploy.cmd` 与 `release.cmd` 自己会加，不用手动调。
 
 **托盘图标是必需文件。** exe 单独拷走时图标会找不到，托盘不显示。程序会依次查找
 `<exe目录>\tray\`、`<exe目录>\assets\tray\`、`%APPDATA%\WGOpt\icons\`。

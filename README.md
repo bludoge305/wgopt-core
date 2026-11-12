@@ -241,13 +241,30 @@ cargo run --release --example hotkey_trigger
 
 ## 构建
 
-需要 Rust（GNU 工具链）、MinGW binutils，以及 NSIS。
+需要 Rust（GNU 工具链）、MinGW-w64 binutils，以及 NSIS。
 
 `PATH` 里必须有 `as.exe` 与 `dlltool.exe`，否则链接 `windows` crate 时会报
 `error calling dlltool 'dlltool.exe': program not found`。Rust 自带的
 `.../rustlib/x86_64-pc-windows-gnu/bin/self-contained/dlltool.exe` 不够用——
-它缺少 `as.exe`，链接阶段仍会失败。装一份完整的 MinGW-w64，或像原版仓库那样
-把工具链放在 `.toolchain\mingw64\bin` 并加进 `PATH`。
+它缺少 `as.exe`，链接阶段仍会失败。所以需要一份完整的 MinGW-w64。
+
+**工具链不进仓库。** 完整的 MinGW-w64 约 500 MB、11000 多个文件，
+放进 git 会让每次 clone 都下载几百 MB。改成固定版本、按需下载：
+
+```bat
+scripts\fetch-toolchain.cmd       :: 下载解压到 .toolchain\mingw64（已存在则跳过）
+call scripts\use-toolchain.cmd    :: 把它加进当前 shell 的 PATH
+```
+
+`fetch-toolchain.cmd` 下载的是 winlibs personal build
+`gcc-16.2.0 / mingw-w64ucrt 14.0.0 / posix threads / SEH`，与开发时所用版本
+一致（`gcc -v` 报 `MinGW-W64 x86_64-ucrt-posix-seh, built by Brecht Sanders, r3`）。
+`.toolchain\` 已在 `.gitignore` 里，不会被提交。要换版本就改脚本顶部的
+`WL_VER` / `WL_FILE` 两个变量。
+
+`deploy.cmd` 与 `release.cmd` 已经把 `.toolchain\mingw64\bin` 放在 PATH 最前面，
+所以只要跑过一次 `fetch-toolchain.cmd`，这两个脚本就能直接用。手动 `cargo build`
+时先用 `use-toolchain.cmd` 把工具链挂上去。
 
 ```bat
 deploy.cmd            :: 编译 exe 并部署托盘图标
@@ -258,7 +275,7 @@ build-installer.cmd   :: 打安装包
 
 | 文件 | 说明 |
 |---|---|
-| `target\release\wgopt.exe` | 主程序，约 820 KB |
+| `target\release\wgopt.exe` | 主程序，约 830 KB |
 | `target\release\bundle\WGOpt-Core-<版本>-x64-setup.exe` | 安装包，约 740 KB |
 
 `build-installer.cmd` 会自动找 NSIS：先看 `NSIS_HOME`，再找 Tauri 缓存的
