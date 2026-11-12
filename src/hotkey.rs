@@ -302,15 +302,21 @@ pub fn raw_unregister(hwnd: HWND, id: i32) {
 
 /// 前台是否处于「输入/编辑」场景；返回命中的原因，便于写日志。
 ///
-/// 四条判据任一命中即认为是编辑场景：
+/// 判据，任一命中即认为是编辑场景：
 /// 1. 本线程正在操作菜单（托盘菜单是模态的，`TrackPopupMenu` 期间会
 ///    在本线程跑嵌套消息循环，`WM_HOTKEY` 照样送进来）；
 /// 2. 前台线程正在操作菜单；
-/// 3. 前台线程有文本光标位（`hwndCaret`）——原生文本框、富文本、多数 IDE；
-/// 4. 焦点窗口或前台窗口的类名是编辑控件（`Edit`、`RichEdit*`、`Scintilla`…）。
+/// 3. 焦点窗口或前台窗口的类名是编辑控件（`Edit`、`RichEdit*`、`Scintilla`…）；
+/// 4. 有文本光标位，且光标所属窗口的类名也是编辑控件（原生文本框、富文本、
+///    多数 IDE）。
+///
+/// 第 4 条要求「光标 + 编辑类名」同时成立，不能只看 `hwndCaret`：全屏游戏
+/// （实测死亡细胞 `HL_WIN`）会创建一个类名为空的隐藏窗口并给它设 caret，
+/// 只看 caret 会把游戏判成编辑场景，快捷键永远按不动。
 ///
 /// 浏览器内核的 `Chrome_RenderWidgetHostHWND` 一类**不**进类名黑名单：
-/// 整个网页都是它，一刀切会让网页游戏里按不了快捷键；这类场景靠光标位判断。
+/// 整个网页都是它，一刀切会让网页游戏里按不了快捷键。这类场景由第 4 条
+/// 兜底——网页里的输入框会让 caret 所属窗口带上可识别的编辑类名。
 pub fn editing_reason() -> Option<&'static str> {
     let self_tid = unsafe { GetCurrentThreadId() };
     if in_menu_mode(self_tid) {
@@ -332,24 +338,40 @@ pub fn editing_reason() -> Option<&'static str> {
         if in_menu_mode(tid) {
             return Some("前台正在操作菜单");
         }
-        if has_caret(tid) {
-            return Some("前台有文本光标");
-        }
 
-        let mut focus = fg;
         let mut info = GUITHREADINFO {
             cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
             ..Default::default()
         };
-        if GetGUIThreadInfo(tid, &mut info).is_ok() && !info.hwndFocus.is_invalid() {
+        let info_ok = GetGUIThreadInfo(tid, &mut info).is_ok();
+
+        // 焦点窗口优先，取不到时退回前台窗口
+        let mut focus = fg;
+        if info_ok && !info.hwndFocus.is_invalid() {
             focus = info.hwndFocus;
         }
 
-        if is_edit_class(&class_name(focus)) {
+        let focus_class = class_name(focus);
+        let fg_class = class_name(fg);
+
+        if is_edit_class(&focus_class) {
             return Some("焦点窗口是文本编辑控件");
         }
-        if is_edit_class(&class_name(fg)) {
+        if is_edit_class(&fg_class) {
             return Some("前台窗口是文本编辑控件");
+        }
+
+        // caret 只在它所在的窗口"看起来可编辑"时才算编辑场景。
+        // 游戏/播放器设的空类名 caret 不算。
+        if info_ok && !info.hwndCaret.is_invalid() {
+            let caret_class = class_name(info.hwndCaret);
+            let caret_is_edit = is_edit_class(&caret_class)
+                // caret 窗口就是焦点窗口时，继承焦点窗口的类名判断
+                || (info.hwndCaret == focus && is_edit_class(&focus_class))
+                || (info.hwndCaret == fg && is_edit_class(&fg_class));
+            if caret_is_edit {
+                return Some("前台有文本光标");
+            }
         }
         None
     }
@@ -366,12 +388,6 @@ fn gui_info(tid: u32) -> Option<GUITHREADINFO> {
 fn in_menu_mode(tid: u32) -> bool {
     gui_info(tid)
         .map(|i| i.flags.contains(GUI_INMENUMODE) || i.flags.contains(GUI_POPUPMENUMODE))
-        .unwrap_or(false)
-}
-
-fn has_caret(tid: u32) -> bool {
-    gui_info(tid)
-        .map(|i| !i.hwndCaret.is_invalid())
         .unwrap_or(false)
 }
 
@@ -460,8 +476,8 @@ pub fn sync_binding(
 /// 一次快捷键触发的处理结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TriggerOutcome {
-    /// 已按当前状态投递切换命令
-    Toggled(crate::app::ToggleAction),
+    /// 已按当前状态投递切换命令；开始方向附上本次识别到的前台进程
+    Toggled(crate::app::ToggleAction, Option<String>),
     /// 当前没有注册成功的快捷键
     NotRegistered,
     /// 处于输入/编辑场景，已忽略（附命中原因）
@@ -477,14 +493,17 @@ impl TriggerOutcome {
     pub fn log_line(&self) -> String {
         use crate::app::ToggleAction;
         match self {
-            TriggerOutcome::Toggled(ToggleAction::Start) => {
-                "快捷键触发：立即开始优化".into()
+            TriggerOutcome::Toggled(ToggleAction::Start, Some(game)) => {
+                format!("快捷键触发：立即开始优化（识别到前台进程 {game}）")
             }
-            TriggerOutcome::Toggled(ToggleAction::Stop) => {
+            TriggerOutcome::Toggled(ToggleAction::Start, None) => {
+                "快捷键触发：立即开始优化（未识别到可提升的前台进程）".into()
+            }
+            TriggerOutcome::Toggled(ToggleAction::Stop, _) => {
                 "快捷键触发：停止优化并还原".into()
             }
             // 其余分支理论上不会出现，真出现说明 command 映射漏了一种
-            TriggerOutcome::Toggled(other) => {
+            TriggerOutcome::Toggled(other, _) => {
                 format!("快捷键触发：{}（该状态本不该投递命令）", other.label())
             }
             TriggerOutcome::NotRegistered => "快捷键已忽略：当前没有注册成功".into(),
@@ -501,7 +520,10 @@ impl TriggerOutcome {
 ///
 /// 判定与投递全部交给 [`crate::app::Shared::request_toggle`]，与托盘菜单点击
 /// 走同一个函数——菜单能做的切换，快捷键就能做；菜单灰掉的，快捷键也不做。
-/// 四道闸按代价从低到高排列。
+///
+/// 「开始」方向会在投递前抓一次前台窗口，把识别到的进程名写进配置并
+/// 随命令一起交给工作线程。捕获失败（桌面/锁屏/命中排除清单）不算错误：
+/// 仍然开始优化，只是没有要提升的进程，原因写日志。
 pub fn trigger(
     shared: &crate::app::Shared,
     binding: &HotkeyBinding,
@@ -524,12 +546,44 @@ pub fn trigger(
         return TriggerOutcome::TooFrequent;
     }
 
+    // 只在"开始"方向捕获：还原方向不需要知道是哪个进程。
+    // 捕获要读配置与前台窗口，放在所有拒绝闸门之后，避免被忽略的按键
+    // 也去碰 I/O。
+    let captured = if action == crate::app::ToggleAction::Start {
+        capture_target(shared)
+    } else {
+        None
+    };
+
     // 重新判定一次再投递：上面几道闸之间状态可能已经变了（例如后台刚跑完
     // 一轮优化）。request_toggle 内部判定与投递是原子的，以它为准。
     let (action, command) = shared.request_toggle();
     match command {
-        Some(_) => TriggerOutcome::Toggled(action),
+        Some(_) => TriggerOutcome::Toggled(action, captured),
         None => TriggerOutcome::NotAvailable(action),
+    }
+}
+
+/// 抓前台进程并写入配置，返回可用于提升的进程名。
+///
+/// 失败一律降级为 `None`（照常优化，只是不提升任何进程），原因写日志。
+fn capture_target(shared: &crate::app::Shared) -> Option<String> {
+    let result = crate::focus::capture_and_persist(shared, crate::winapi::current_pid());
+    match result {
+        (Ok(name), None) => Some(name),
+        (Ok(name), Some(err)) => {
+            // 写盘失败不影响本次提权，但要让用户知道下次启动不会记得
+            shared.notify(
+                "识别到前台进程，但记录失败",
+                format!("{name}：{err}"),
+                crate::tray::NotifyKind::Warn,
+            );
+            Some(name)
+        }
+        (Err(why), _) => {
+            crate::logging::info(&format!("快捷键未提升任何进程：{}", why.reason()));
+            None
+        }
     }
 }
 
@@ -626,6 +680,18 @@ mod tests {
         assert!(!is_edit_class("SDL_app"));
         assert!(!is_edit_class("Chrome_RenderWidgetHostHWND"));
         assert!(!is_edit_class(""));
+    }
+
+    /// 空类名不是编辑控件——这条是「全屏游戏被判成编辑场景」的根因。
+    ///
+    /// 实测死亡细胞（窗口类 `HL_WIN`）会创建一个类名为空的隐藏窗口并给它
+    /// 设 caret。旧实现只看 `hwndCaret` 是否有效，于是把游戏当编辑场景，
+    /// 快捷键永远按不动。现在要求 caret 所在窗口的类名也是编辑控件。
+    #[test]
+    fn empty_class_name_is_not_edit() {
+        assert!(!is_edit_class(""));
+        assert!(!is_edit_class("   "));
+        assert!(is_edit_class("Edit"));
     }
 
     #[test]

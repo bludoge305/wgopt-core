@@ -35,7 +35,6 @@ fn main() {
 
     let shared = Shared::new(Config {
         enabled: true,
-        auto_optimize: false,
         // 两项都可能命中 WE，默认顺序下 background 在前
         enabled_items: vec!["background".to_string(), "wallpaper".to_string()],
         notify_on_start: false,
@@ -44,7 +43,7 @@ fn main() {
     });
 
     println!("\n[1] 优化（两个可能命中 WE 的项）");
-    for r in app::optimize_now(&shared, None) {
+    for r in app::optimize_now(&shared) {
         println!("    {:<10} {:?}  {}", r.id, r.status, r.detail);
     }
 

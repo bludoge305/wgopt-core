@@ -36,6 +36,16 @@ fn main() {
         std::process::exit(code);
     }
 
+    // 未知参数直接报错退出，而不是当成"没有参数"去常驻：`--autostart`
+    // 之外还有历史脚本可能传 `--detect` 之类已移除的开关，静默启动一个
+    // 托盘实例反而更难排查。
+    if let Some(unknown) = args.iter().find(|a| a.as_str() != "--autostart") {
+        attach_console();
+        eprintln!("未知的参数：{unknown}");
+        eprintln!("用 wgopt --help 查看可用开关。");
+        std::process::exit(2);
+    }
+
     // ---- 0.5 常驻模式：与原版一致，运行时 runas 提权 ----
     wgopt_core::elevate::ensure_admin();
 
@@ -55,9 +65,8 @@ fn main() {
 
     let cfg = config::load();
     logging::info(&format!(
-        "配置：总开关={}，自动优化={}，启用项 {} 个",
+        "配置：总开关={}，启用项 {} 个",
         cfg.enabled,
-        cfg.auto_optimize,
         cfg.enabled_items.len()
     ));
 
@@ -115,11 +124,11 @@ fn main() {
         }
     }
 
-    // ---- 5. 后台检测线程 ----
+    // ---- 5. 后台工作线程 ----
     let worker = shared.clone();
     std::thread::Builder::new()
-        .name("wgopt-guardian".into())
-        .spawn(move || app::run_guardian(worker))
+        .name("wgopt-worker".into())
+        .spawn(move || app::run_worker(worker))
         .unwrap_or_else(|e| {
             logging::error(&format!("后台线程启动失败：{e}"));
             std::process::exit(1);
@@ -215,7 +224,6 @@ fn attach_console() {
 /// 命令行开关一览。`run_cli` 与 [`cli_needs_admin`] 共用，避免两边漏掉同一个开关。
 const CLI_COMMANDS: &[&str] = &[
     "--status",
-    "--detect",
     "--optimize-once",
     "--restore",
     "--version",
@@ -234,8 +242,8 @@ fn cli_needs_admin(args: &[String]) -> bool {
 
 /// 处理命令行诊断子命令。返回 `Some(退出码)` 表示已处理完毕，无需常驻。
 ///
-/// 这些开关不参与后台常驻逻辑，只用于在终端里检查配置、识别结果与
-/// 单次优化的实际效果——后台程序没有界面，排障全靠它们。
+/// 这些开关不参与后台常驻逻辑，只用于在终端里检查配置与单次优化的
+/// 实际效果——后台程序没有界面，排障全靠它们。
 fn run_cli(args: &[String]) -> Option<i32> {
     let cmd = args.first()?.as_str();
     if !CLI_COMMANDS.contains(&cmd) {
@@ -259,23 +267,6 @@ fn run_cli(args: &[String]) -> Option<i32> {
             print_status();
             Some(0)
         }
-        "--detect" => {
-            let hit = detect_once();
-            match hit {
-                Some(g) => {
-                    println!("检测到游戏：{}（{} · PID {}）", g.label(), g.name, g.pid);
-                    println!("判定得分：{}", g.score);
-                    for r in &g.reasons {
-                        println!("  · {r}");
-                    }
-                    Some(0)
-                }
-                None => {
-                    println!("未检测到游戏");
-                    Some(1)
-                }
-            }
-        }
         "--optimize-once" => Some(cli_optimize(false)),
         "--restore" => Some(cli_optimize(true)),
         _ => None,
@@ -288,7 +279,6 @@ fn print_help() {
     println!("用法：");
     println!("  wgopt                    启动托盘常驻（默认）");
     println!("  wgopt --status           显示配置与运行环境");
-    println!("  wgopt --detect           执行一轮游戏识别并输出判定依据");
     println!("  wgopt --optimize-once    执行一轮优化（不常驻）");
     println!("  wgopt --restore          说明还原入口（快照只在运行中的进程里）");
     println!("  wgopt --version          显示版本");
@@ -308,32 +298,12 @@ fn print_status() {
     println!("物理内存：{} / {}", wgopt_core::winapi::format_bytes(mem_avail), wgopt_core::winapi::format_bytes(mem_total));
     println!();
     println!("总开关：{}", if cfg.enabled { "开" } else { "关" });
-    println!("自动优化：{}", if cfg.auto_optimize { "开" } else { "关" });
     println!("开机自启：{}", if config::is_autostart_enabled() { "开" } else { "关" });
     println!("优化项：");
     for def in wgopt_core::item_definitions() {
         let mark = if cfg.is_item_enabled(&def.id) { "✓" } else { " " };
         println!("  [{mark}] {:<11} {}", def.id, def.label);
     }
-}
-
-fn detect_once() -> Option<wgopt_core::game_detect::GameCandidate> {
-    let mut cpu = wgopt_core::game_detect::CpuSampler::new();
-    let mut gpu = wgopt_core::gpu::GpuSampler::new();
-
-    // GPU 计数器需要两次读数，先建立基线再采样
-    let _ = cpu.sample();
-    if let Some(g) = gpu.as_mut() {
-        let _ = g.collect();
-    }
-    std::thread::sleep(std::time::Duration::from_millis(1200));
-
-    let cpu_usage = cpu.sample();
-    let gpu_usage = match gpu.as_mut() {
-        Some(g) => g.collect(),
-        None => Default::default(),
-    };
-    wgopt_core::game_detect::detect_game(&cpu_usage, &gpu_usage)
 }
 
 /// 单次执行优化或还原，输出到控制台。
@@ -361,9 +331,26 @@ fn cli_optimize(restore: bool) -> i32 {
         return 1;
     }
 
+    // 命令行单次优化没有"刚按快捷键"这个上下文，所以没有可识别的前台
+    // 进程；用配置里上次记录的目标（若它已被加进排除清单，这里会拒绝）。
+    let target = if cfg.game_process.trim().is_empty() {
+        None
+    } else {
+        match wgopt_core::focus::check_target(&cfg, &cfg.game_process) {
+            Ok(name) => {
+                println!("提升目标（来自配置）：{name}");
+                Some(name)
+            }
+            Err(why) => {
+                println!("配置里的 game_process 不可用：{}", why.reason());
+                None
+            }
+        }
+    };
+
     let mut snap = wgopt_core::Snapshot::default();
     println!("开始优化，共 {} 项", cfg.enabled_items.len());
-    let results = wgopt_core::engine::run_items(&cfg.enabled_items, None, &mut snap);
+    let results = wgopt_core::engine::run_items(&cfg.enabled_items, target.as_deref(), &mut snap);
     for r in &results {
         let level = match r.status {
             wgopt_core::ItemStatus::Done => "完成",
@@ -394,13 +381,12 @@ fn icon_for(status: &Status) -> TrayIcon {
 fn build_menu_state(shared: &Shared, binding: &Rc<RefCell<HotkeyBinding>>) -> MenuState {
     let status = shared.status_snapshot();
     let defs = wgopt_core::item_definitions();
-    let (auto, items, hotkey_text) = match shared.config.lock() {
+    let (items, hotkey_text) = match shared.config.lock() {
         Ok(cfg) => (
-            cfg.auto_optimize,
             defs.iter().map(|d| cfg.is_item_enabled(&d.id)).collect(),
             cfg.hotkey.clone(),
         ),
-        Err(_) => (true, vec![true; defs.len()], String::new()),
+        Err(_) => (vec![true; defs.len()], String::new()),
     };
 
     // 勾选状态以「真的注册上了」为准：组合键被别的程序占用时，配置里
@@ -414,7 +400,6 @@ fn build_menu_state(shared: &Shared, binding: &Rc<RefCell<HotkeyBinding>>) -> Me
 
     MenuState {
         enabled: status.enabled,
-        auto,
         autostart: config::is_autostart_enabled(),
         // 菜单文案与灰化来自同一个判定，快捷键也用它
         toggle: shared.toggle_action(),
@@ -455,7 +440,6 @@ fn handle_choice(
 ) {
     match choice {
         MenuChoice::Command(TrayCommand::ToggleEnabled) => toggle_enabled(shared),
-        MenuChoice::Command(TrayCommand::ToggleAuto) => toggle_auto(shared),
         // 菜单点击与快捷键共用同一个状态切换入口，不各自判断方向
         MenuChoice::Command(TrayCommand::ToggleRun) => {
             let (action, command) = shared.request_toggle();
@@ -495,26 +479,6 @@ fn toggle_enabled(shared: &Shared) {
     if !now && shared.has_restorable_changes() {
         shared.post_command(Command::Stop);
     }
-}
-
-fn toggle_auto(shared: &Shared) {
-    let mut now = false;
-    app::persist(shared, |cfg| {
-        cfg.auto_optimize = !cfg.auto_optimize;
-        now = cfg.auto_optimize;
-    });
-    logging::info(&format!("自动优化切换为 {}", now));
-    // 这个开关同时控制后台检测，唤醒守护线程立刻停用/恢复，不等下一轮
-    shared.post_command(Command::ConfigChanged);
-    shared.notify(
-        "WGOpt",
-        if now {
-            "已开启：恢复后台检测，检测到游戏后自动优化"
-        } else {
-            "已关闭：后台已停止检测游戏"
-        },
-        NotifyKind::Info,
-    );
 }
 
 fn toggle_autostart(shared: &Shared) {

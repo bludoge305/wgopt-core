@@ -65,7 +65,6 @@ fn main() {
 
     let shared = Shared::new(Config {
         enabled: true,
-        auto_optimize: false,
         enabled_items: vec!["wallpaper".to_string()],
         notify_on_start: false,
         notify_on_stop: false,
@@ -73,7 +72,7 @@ fn main() {
     });
 
     println!("\n[1] 优化：关闭 WE 并记录路径");
-    for r in app::optimize_now(&shared, None) {
+    for r in app::optimize_now(&shared) {
         println!("    {:<10} {:?}  {}", r.id, r.status, r.detail);
     }
     std::thread::sleep(Duration::from_secs(2));

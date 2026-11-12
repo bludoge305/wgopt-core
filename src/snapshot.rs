@@ -2,13 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 优先级快照：记录为了优化而降级/提升的进程与停止的服务，便于还原。
+/// 优先级快照：记录为了优化而调整的进程与停止的服务，便于还原。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Snapshot {
     /// 被降级的后台进程 (pid, 进程名, 原优先级)
     pub demoted: Vec<(u32, String, String)>,
-    /// 被提升的游戏进程 (pid, 进程名)
-    pub promoted: Vec<(u32, String)>,
+    /// 被提升的进程 (pid, 进程名, 原优先级)，快捷键识别出的游戏进程
+    #[serde(default)]
+    pub promoted: Vec<(u32, String, String)>,
     /// 被停止的服务名
     pub stopped_services: Vec<String>,
     /// 被关闭的程序可执行文件路径（如 Wallpaper Engine），还原时重新启动
@@ -40,7 +41,7 @@ impl Snapshot {
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
         if !self.promoted.is_empty() {
-            parts.push(format!("提升 {} 个游戏进程", self.promoted.len()));
+            parts.push(format!("提升 {} 个进程", self.promoted.len()));
         }
         if !self.demoted.is_empty() {
             parts.push(format!("降级 {} 个后台进程", self.demoted.len()));
@@ -82,13 +83,25 @@ mod tests {
     }
 
     #[test]
-    fn old_config_without_killed_programs_still_deserializes() {
+    fn old_snapshot_without_killed_programs_still_deserializes() {
         // 旧版本写的快照没有这个字段，缺省应为空而不是解析失败
         let snap: Snapshot = serde_json::from_str(
             r#"{"demoted":[],"promoted":[],"stopped_services":[]}"#,
         )
         .unwrap();
         assert!(snap.killed_programs.is_empty());
+        assert!(snap.is_empty());
+    }
+
+    /// 提升记录也是可还原的改动，不能因为只有它就让快照被当成空。
+    #[test]
+    fn promoted_alone_makes_snapshot_non_empty() {
+        let snap = Snapshot {
+            promoted: vec![(1234, "game.exe".into(), "正常".into())],
+            ..Default::default()
+        };
+        assert!(!snap.is_empty());
+        assert!(snap.summary().contains("提升 1 个进程"));
     }
 
     /// 新一轮优化不能丢掉上一轮关掉、还没还原的程序，

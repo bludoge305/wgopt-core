@@ -50,7 +50,7 @@ fn main() {
     let shared = Shared::new(config_with(&["wallpaper"]));
 
     println!("\n[1] 执行优化（仅 wallpaper 项）");
-    let results = app::optimize_now(&shared, None);
+    let results = app::optimize_now(&shared);
     for r in &results {
         println!("    {:<10} {:?}  {}", r.id, r.status, r.detail);
     }
@@ -84,7 +84,7 @@ fn main() {
     // 保持默认顺序：background 在 wallpaper 之前
     let shared = Shared::new(config_with(&["background", "wallpaper"]));
 
-    for r in app::optimize_now(&shared, None) {
+    for r in app::optimize_now(&shared) {
         println!("    {:<10} {:?}  {}", r.id, r.status, r.detail);
     }
     std::thread::sleep(Duration::from_secs(2));
@@ -116,9 +116,9 @@ fn main() {
     println!("\n[5] 场景 B：连续两轮优化不还原（快照不得丢失待还原记录）");
     let shared = Shared::new(config_with(&["wallpaper"]));
 
-    app::optimize_now(&shared, None);
+    app::optimize_now(&shared);
     std::thread::sleep(Duration::from_secs(1));
-    app::optimize_now(&shared, None);
+    app::optimize_now(&shared);
     std::thread::sleep(Duration::from_secs(1));
 
     let recorded = {
@@ -144,11 +144,10 @@ fn main() {
     }
 }
 
-/// 验证用的配置：只启用指定项，关掉自动优化与通知，避免干扰判断。
+/// 验证用的配置：只启用指定项、关掉通知，避免干扰判断。
 fn config_with(items: &[&str]) -> Config {
     Config {
         enabled: true,
-        auto_optimize: false,
         enabled_items: items.iter().map(|s| s.to_string()).collect(),
         notify_on_start: false,
         notify_on_stop: false,

@@ -5,29 +5,42 @@
 原版 [WGOpt](https://github.com/bludoge305/WGOpt) 是 Tauri 桌面应用（图形界面 + 托盘）。
 本仓库是它的**无界面版本**：去掉 WebView 与全部界面，只保留托盘常驻与优化核心。
 
-**优化机制、白名单、游戏识别算法一律照搬原版，不做"改进"。** 想改核心逻辑先去
+**优化机制、白名单一律照搬原版，不做"改进"。** 想改核心逻辑先去
 原版确认，再同步过来；本仓库不发明新策略。
+
+**本仓库没有游戏检测与自动优化轮询。** 优化只在用户通过托盘菜单或全局快捷键
+明确要求时执行。原版的 GPU 占用采样、进程识别算法、定时轮询与自动触发逻辑
+不在本仓库内，不要把这类代码"补"回来。
+
+**快捷键的「开始」方向会识别前台进程。** 按下时读 `GetForegroundWindow` 所属
+进程名，经排除清单校验后写入配置 `game_process` 并提权。这不是游戏识别：
+没有任何评分、阈值或轮询，只看此刻前台是哪个进程。相关逻辑集中在
+`focus.rs`，不要在 `hotkey.rs` 里另写一份判定。
+
+**排除清单必须挡在提权之前。** `excluded_processes`（用户可改）与
+`PROTECTED_PROCESSES`（硬编码）两道都要过。`app::resolve_target` 从配置读取
+`game_process` 时会再校验一次——用户可能把某进程加进排除清单却忘了清空
+`game_process`，那时不能凭旧记录提权。
 
 关联仓库：
 
 | 仓库 | 定位 |
 |---|---|
-| WGOpt（私有） | 带图形界面的桌面版 |
-| **wgopt-core（本仓库，公开）** | 无界面托盘常驻版 |
+| WGOpt（私有） | 带图形界面的桌面版（含游戏检测与自动优化） |
+| **wgopt-core（本仓库，公开）** | 无界面托盘常驻版，手动触发优化 |
 
 ## 代码结构
 
 ```
 src/
-  winapi.rs          Win32 封装：进程/服务/内存/剪贴板/DNS
+  winapi.rs          Win32 封装：进程/服务/内存/剪贴板/DNS/前台窗口
   whitelist.rs       白名单与硬性排除（改动须与原版一致）
   item.rs            8 个优化项定义、Status 枚举
-  snapshot.rs        可还原改动的快照
+  snapshot.rs        可还原改动的快照（含被提升的进程）
   engine.rs          8 项优化与还原
-  gpu.rs             GPU 占用采集（PDH 计数器）
-  game_detect.rs     游戏识别（GPU 主判据 + 多维加权）
-  config.rs          配置读写、开机自启
-  app.rs             后台守护：状态机、3s 轮询、自动优化/还原
+  focus.rs           前台进程捕获、排除清单判定、目标持久化
+  config.rs          配置读写、开机自启、排除清单默认值
+  app.rs             后台工作线程：命令队列、手动优化/还原
   hotkey.rs          全局快捷键（RegisterHotKey）与编辑场景判定
   tray.rs            托盘图标、右键菜单、气泡通知
   window.rs          不可见消息窗口（WS_EX_TOOLWINDOW，非 message-only）与消息循环
@@ -54,7 +67,7 @@ manifests`。提权走运行时 `ShellExecuteExW(runas)`，与原版一致。
 写坏时继续结束进程、停服务，属于误伤。见 `config::load_from_dir` 与
 `broken_json_fails_safe_to_disabled` 测试。
 
-**优化项、白名单、阈值不要随手调。** `THRESHOLD = 60`、`BACKGROUND_WHITELIST`、
+**优化项、白名单不要随手调。** `BACKGROUND_WHITELIST`、
 `PROTECTED_PROCESSES`、`SERVICE_WHITELIST` 都是原版实测过的值。
 
 **快捷键必须带修饰键。** `hotkey::Hotkey::parse` 拒绝裸键（`F2`、`A`）——注册成
@@ -65,9 +78,11 @@ manifests`。提权走运行时 `ShellExecuteExW(runas)`，与原版一致。
 与「停止优化并还原」是同一个状态开关的两个方向，判定只能有一份。别在快捷键或菜单
 路径上另写可用性判断，否则会出现「菜单灰了但按快捷键还能跑」或两边方向不一致。
 
-**编辑场景判定不要加浏览器类名黑名单。** 网页游戏的前台窗口就是
-`Chrome_RenderWidgetHostHWND` 这类通用窗口类，加进去会让网页游戏里按不了
-快捷键。这类场景靠 `hwndCaret` 判断即可。
+**编辑场景判定不能只看 `hwndCaret`。** 全屏游戏（实测死亡细胞，窗口类
+`HL_WIN`）会创建一个类名为空的隐藏窗口并给它设 caret；只要 caret 有效就判
+「前台有文本光标」，游戏里按快捷键会永远失效。正确做法是要求 caret 所在窗口
+的类名也是编辑控件（`Edit` / `RichEdit*` / `Scintilla` / `_WwG`），见
+`hotkey::editing_reason` 与 `empty_class_name_is_not_edit` 测试。
 
 **消息窗口不能用 `HWND_MESSAGE`。** message-only 窗口收不到系统广播，
 Explorer 重启后的 `TaskbarCreated` 到不了，`reattach` 永远不触发，托盘图标
@@ -138,7 +153,6 @@ build-installer.cmd   :: 用 NSIS 打安装包
 
 ```bat
 wgopt --status          :: 配置、权限、内存、各项开关
-wgopt --detect          :: 一轮游戏识别 + 判定依据
 wgopt --optimize-once   :: 真跑一遍 8 项，看每项 detail 与耗时
 ```
 

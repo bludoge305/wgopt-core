@@ -29,7 +29,7 @@ const TRAY_ID: u32 = 1;
 /// 三态图标。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayIcon {
-    /// 待机：未检测到游戏
+    /// 待机：没有正在生效的优化
     Idle,
     /// 优化生效中
     Active,
@@ -59,7 +59,6 @@ pub enum NotifyKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     ToggleEnabled,
-    ToggleAuto,
     /// 优化状态切换：未优化时开始、已优化时还原。
     ///
     /// 具体走哪个方向由 `app::Shared::toggle_action` 判定，不在菜单层判断。
@@ -82,7 +81,6 @@ pub enum MenuChoice {
 #[derive(Debug, Clone)]
 pub struct MenuState {
     pub enabled: bool,
-    pub auto: bool,
     pub autostart: bool,
     /// 优化状态切换项：文案与可用性都取自同一个判定
     pub toggle: ToggleAction,
@@ -97,7 +95,6 @@ pub struct MenuState {
 }
 
 const ID_TOGGLE_ENABLED: u32 = 1;
-const ID_TOGGLE_AUTO: u32 = 2;
 /// 优化状态切换项（开始/还原共用）。
 const ID_TOGGLE_RUN: u32 = 3;
 /// 原「立即开始优化」的 id，与切换项合并后不再使用；保留常量避免 id 复用冲突。
@@ -326,12 +323,6 @@ fn build_menu(menu: HMENU, state: &MenuState) {
         ID_TOGGLE_ENABLED,
         "启用优化总开关",
     );
-    menu_str(
-        menu,
-        MF_STRING | if state.auto { MF_CHECKED } else { MF_STRING },
-        ID_TOGGLE_AUTO,
-        "游戏运行时自动优化",
-    );
 
     menu_str(menu, MF_SEPARATOR, 0, "");
 
@@ -380,7 +371,6 @@ fn translate_choice(id: u32) -> Option<MenuChoice> {
     Some(match id {
         0 => return None,
         ID_TOGGLE_ENABLED => MenuChoice::Command(Command::ToggleEnabled),
-        ID_TOGGLE_AUTO => MenuChoice::Command(Command::ToggleAuto),
         ID_TOGGLE_RUN => MenuChoice::Command(Command::ToggleRun),
         ID_TOGGLE_AUTOSTART => MenuChoice::Command(Command::ToggleAutostart),
         ID_TOGGLE_HOTKEY => MenuChoice::Command(Command::ToggleHotkey),
@@ -429,7 +419,6 @@ mod tests {
     fn state(toggle: ToggleAction, hotkey_enabled: bool, hotkey_label: &str) -> MenuState {
         MenuState {
             enabled: !matches!(toggle, ToggleAction::Disabled),
-            auto: true,
             autostart: false,
             toggle,
             hotkey_enabled,

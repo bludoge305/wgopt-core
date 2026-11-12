@@ -68,30 +68,6 @@ pub const PROTECTED_PROCESSES: &[&str] = &[
 /// 允许操作的服务白名单。
 pub const SERVICE_WHITELIST: &[&str] = &["XblAuthManager", "WSearch"];
 
-/// 会被识别的游戏进程名（常见启动器与游戏）。
-pub const KNOWN_GAMES: &[&str] = &[
-    "blackmythwukong.exe",
-    "b1-win64-shipping.exe",
-    "gow.exe",
-    "eldenring.exe",
-    "cs2.exe",
-    "dota2.exe",
-    "valorant.exe",
-    "league of legends.exe",
-    "genshinimpact.exe",
-    "yuanshen.exe",
-    "starrail.exe",
-    "overwatch.exe",
-    "destiny2.exe",
-    "r5apex.exe",
-    "pubg.exe",
-    "tslgame.exe",
-    "forzahorizon5.exe",
-    "cyberpunk2077.exe",
-    "bg3.exe",
-    "bg3_dx11.exe",
-];
-
 /// 是否属于受保护进程。
 pub fn is_protected(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -102,10 +78,4 @@ pub fn is_protected(name: &str) -> bool {
 pub fn in_background_whitelist(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     BACKGROUND_WHITELIST.iter().any(|p| *p == lower)
-}
-
-/// 是否是已知游戏进程名。
-pub fn is_known_game(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    KNOWN_GAMES.iter().any(|g| *g == lower)
 }

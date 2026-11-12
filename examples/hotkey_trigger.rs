@@ -41,12 +41,11 @@ fn main() {
     // 只跑 dns 项：刷新解析缓存，不需要管理员、不改系统状态
     let mut cfg = Config::default();
     cfg.enabled = true;
-    cfg.auto_optimize = false; // 关掉后台检测，避免真游戏干扰
     cfg.enabled_items = vec!["dns".to_string()];
     let shared = Shared::new(cfg);
 
     let worker = shared.clone();
-    std::thread::spawn(move || app::run_guardian(worker));
+    std::thread::spawn(move || app::run_worker(worker));
 
     let hwnd = window::create_message_window().expect("消息窗口");
     let hk = Hotkey::parse("Ctrl+F2").unwrap();
@@ -60,7 +59,7 @@ fn main() {
     expect(
         "[1] 待机时按下（应开始）",
         &r,
-        TriggerOutcome::Toggled(ToggleAction::Start),
+        TriggerOutcome::Toggled(ToggleAction::Start, None),
         &mut failed,
     );
     wait_phase(&shared, Phase::Optimized, &mut failed, "[1] 后台未完成优化");
@@ -70,7 +69,7 @@ fn main() {
     expect(
         "[2] 已优化时按下（应还原）",
         &r,
-        TriggerOutcome::Toggled(ToggleAction::Stop),
+        TriggerOutcome::Toggled(ToggleAction::Stop, None),
         &mut failed,
     );
     wait_phase(&shared, Phase::Idle, &mut failed, "[2] 后台未还原");
@@ -80,7 +79,7 @@ fn main() {
     expect(
         "[3] 还原后再按下（应再次开始）",
         &r,
-        TriggerOutcome::Toggled(ToggleAction::Start),
+        TriggerOutcome::Toggled(ToggleAction::Start, None),
         &mut failed,
     );
     wait_phase(&shared, Phase::Optimized, &mut failed, "[3] 后台未完成第二轮优化");
@@ -166,7 +165,7 @@ fn main() {
     let outcomes = seen.borrow().clone();
     println!("[6] 真按 {hk} 两下，收到 {outcomes:?}");
     match outcomes.first() {
-        Some(TriggerOutcome::Toggled(ToggleAction::Start)) => {}
+        Some(TriggerOutcome::Toggled(ToggleAction::Start, _)) => {}
         other => failed.push(format!("[6] 第一下应开始优化，实际 {other:?}")),
     }
     match outcomes.get(1) {

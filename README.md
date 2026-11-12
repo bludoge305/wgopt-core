@@ -1,8 +1,13 @@
 # WGOpt Core
 
-无界面的游戏优化后台程序：常驻系统托盘，检测到游戏时按原版 WGOpt 的机制自动优化，游戏退出后自动还原。
+无界面的系统优化后台程序：常驻系统托盘，按托盘菜单或全局快捷键手动执行一轮优化，
+可随时停止并还原。
 
-原版 [WGOpt](https://github.com/bludoge305/WGOpt) 是 Tauri 桌面应用（界面 + 托盘）。本仓库去掉图形界面，只保留核心：托盘状态显示、托盘开关、配置文件控制、系统通知。
+原版 [WGOpt](https://github.com/bludoge305/WGOpt) 是 Tauri 桌面应用（界面 + 托盘）。
+本仓库去掉图形界面，只保留核心：托盘状态显示、托盘开关、配置文件控制、系统通知。
+
+> **没有游戏检测与自动优化。** 本版本不轮询进程、不采样 GPU、不识别游戏，
+> 优化只在用户明确要求时执行。原版那套识别与自动触发逻辑不在本仓库内。
 
 ## 功能
 
@@ -12,15 +17,14 @@
 
 | 图标 | 含义 | 提示 |
 |---|---|---|
-| 蓝色（原图） | 待机，未检测到游戏 | `WGOpt · 空闲` |
-| 蓝色 + 绿色对勾 | 优化已生效 | `WGOpt · 已优化 · <游戏名>` |
+| 蓝色（原图） | 待机 | `WGOpt · 空闲` |
+| 蓝色 + 绿色对勾 | 优化已生效 | `WGOpt · 已优化` |
 | 灰色 + 暂停 | 总开关关闭 | `WGOpt · 已停用` |
 
 **托盘右键菜单**控制总开关与各项：
 
-- 顶部一行显示当前状态与已完成项数（如 `状态：已优化 7/8 · 黑神话：悟空`）
-- `启用优化总开关` —— 关闭后立刻还原已做的改动，并停止一切检测
-- `游戏运行时自动优化` —— 同时是后台游戏检测的开关：关闭后立即停用检测（不再轮询、不再采样 CPU/GPU、不再识别），重新开启时恢复
+- 顶部一行显示当前状态与已完成项数（如 `状态：已优化 7/8`）
+- `启用优化总开关` —— 关闭后立刻还原已做的改动
 - `立即开始优化` / `停止优化并还原` —— **同一个菜单项**，按当前状态显示对应文案，右侧显示快捷键
 - `启用快捷键（Ctrl+F2）` —— 全局快捷键开关，勾选后立即注册/注销
 - 8 个优化项逐项勾选（等价于改配置文件，会立即写回）
@@ -34,14 +38,33 @@
 **全局快捷键**默认 `Ctrl+F2`，按下同样是状态切换：
 
 - 当前未优化 → 执行「立即开始优化」；当前已优化 → 执行「停止优化并还原」
+- **开始方向会先识别前台进程**：读当前前台窗口所属的进程名，通过排除清单
+  校验后记为提升目标，写进配置的 `game_process`，并把它提到「高」优先级
 - 优化进行中不响应，与菜单项的灰化条件一致
 - 判定与投递走 `Shared::request_toggle`，与点击菜单项是同一个函数，
   菜单能做的切换快捷键就能做，菜单灰掉的快捷键也不做
-- 输入场景不误触：前台有文本光标、焦点在 `Edit` / `RichEdit` / `Scintilla`
-  一类编辑控件、或正在操作菜单时直接忽略
+- 输入场景不误触：焦点在 `Edit` / `RichEdit` / `Scintilla` 一类编辑控件、
+  光标所在窗口也确实是编辑控件、或正在操作菜单时直接忽略
+  （只看"有光标"会误伤全屏游戏——它们会创建一个类名为空的隐藏窗口挂 caret）
 - 按住不放只触发一次（注册时带 `MOD_NOREPEAT`）；连按另有 1 秒闸门，
   防止后台还没切到「优化中」时排队出多轮
 - 组合键被别的程序占用时，托盘开关自动回到关闭并弹一条提醒
+
+**前台进程识别**（只在「开始优化」方向执行）：
+
+| 情况 | 行为 |
+|---|---|
+| 前台是普通程序（游戏等） | 记为提升目标，写入 `game_process`，提到「高」 |
+| 前台进程在 `excluded_processes` 里 | 不提升，日志记一行原因，优化照常进行 |
+| 前台是受保护的系统进程 | 同上，拒绝提升 |
+| 前台是 WGOpt 自己 | 同上 |
+| 前台窗口无效（桌面 / 锁屏 / 切换中） | 不提升，日志记「没有可识别的前台窗口」 |
+| 配置写盘失败 | 本次仍按识别结果提权，弹出警告说明「下次启动不会记得」 |
+| 目标进程有多个同名实例 | 全部提升 |
+| 目标进程已退出 | 跳过，不报错 |
+
+还原时按快照把提升/降级的优先级都改回去；进程已退出的那一项会如实报
+「恢复失败」而不是装作成功。
 
 按键写法：`Ctrl` / `Alt` / `Shift` / `Win` 用 `+` 与主键相连，例如
 `Ctrl+F2`、`Alt+Shift+F9`、`Ctrl+Space`。必须带至少一个修饰键——裸键注册成
@@ -55,43 +78,61 @@
 ```json
 {
   "enabled": true,
-  "auto_optimize": true,
   "enabled_items": ["priority", "background", "memory", "wallpaper", "xbox", "search", "dns", "clipboard"],
   "autostart": false,
   "notify_on_start": true,
   "notify_on_stop": true,
   "restore_on_exit": true,
   "hotkey_enabled": true,
-  "hotkey": "Ctrl+F2"
+  "hotkey": "Ctrl+F2",
+  "game_process": "BlackMythWukong.exe",
+  "excluded_processes": ["explorer.exe", "chrome.exe", "dwm.exe", "..."],
 }
 ```
 
 | 字段 | 说明 |
 |---|---|
 | `enabled` | 总开关。关闭后不做任何优化，托盘显示"已停用" |
-| `auto_optimize` | 检测到游戏后是否自动优化；同时是后台游戏检测的开关，关闭后不再轮询识别 |
 | `enabled_items` | 启用的优化项 id，见下表 |
 | `autostart` | 开机自启（实际状态以注册表为准） |
 | `notify_on_start` | 开始优化时弹系统通知 |
-| `notify_on_stop` | 停止/自动还原时弹系统通知 |
+| `notify_on_stop` | 停止优化并还原时弹系统通知 |
 | `restore_on_exit` | 退出程序时还原可还原项 |
 | `hotkey_enabled` | 全局快捷键开关，等价于托盘里的「启用快捷键」 |
 | `hotkey` | 快捷键组合，默认 `Ctrl+F2`；改完需重启程序生效 |
+| `game_process` | **程序自动写入**：上次按快捷键时识别到的前台进程。供本次及之后的优化轮次使用。手改成路径也会被归一化成文件名 |
+| `excluded_processes` | **绝不允许提升优先级的进程清单**。大小写不敏感，写入时自动转小写去重。默认 65 项，见下节 |
 
 配置写坏时程序**按停用处理并记日志**，不会静默回退成"全开"——后台进程不该在配置有问题时继续结束进程、停服务。
 
-**系统通知**：状态变化时弹气泡通知——检测到游戏、优化完成（含失败项数）、游戏退出已还原、开关切换。
+旧版本配置里缺少的字段会按默认补齐：`game_process` 为空（还没识别过），
+`excluded_processes` 填入默认排除清单（而不是空清单——空清单等于关掉保护）。
 
-**后台检测只在需要时运行**：`auto_optimize` 关闭时守护线程不采样 CPU/GPU、不调用游戏识别，
-托盘状态回到「待机」，重新开启后重建采样基线再恢复检测。总开关关闭同理。
+**默认排除清单**（65 项，`config::default_excluded_processes`）：
+
+| 类别 | 进程 |
+|---|---|
+| 系统外壳与关键进程 | `explorer.exe` `dwm.exe` `csrss.exe` `wininit.exe` `winlogon.exe` `services.exe` `lsass.exe` `smss.exe` `svchost.exe` `taskhostw.exe` `sihost.exe` `ctfmon.exe` `runtimebroker.exe` `fontdrvhost.exe` `audiodg.exe` `searchhost.exe` `startmenuexperiencehost.exe` `shellexperiencehost.exe` `applicationframehost.exe` `textinputhost.exe` `lockapp.exe` |
+| 浏览器 | `chrome.exe` `msedge.exe` `firefox.exe` `brave.exe` `opera.exe` `vivaldi.exe` `iexplore.exe` `chromium.exe` `zen.exe` |
+| 开发与终端 | `code.exe` `devenv.exe` `pycharm64.exe` `idea64.exe` `windowsterminal.exe` `conhost.exe` `cmd.exe` `powershell.exe` `pwsh.exe` `wsl.exe` `wslhost.exe` |
+| 通讯与办公 | `wechat.exe` `weixin.exe` `qq.exe` `dingtalk.exe` `feishu.exe` `lark.exe` `teams.exe` `slack.exe` `discord.exe` `telegram.exe` `winword.exe` `excel.exe` `powerpnt.exe` `wps.exe` `notion.exe` `obsidian.exe` `typora.exe` |
+| 媒体与直播 | `vlc.exe` `potplayermini64.exe` `mpc-hc64.exe` `wmplayer.exe` `obs64.exe` `obs32.exe` |
+| 本程序 | `wgopt.exe` |
+
+要加自己的程序，直接往 `excluded_processes` 里追加进程名（带 `.exe`）。
+`PROTECTED_PROCESSES` 是另一道硬性防线：即使从排除清单里删掉
+`csrss.exe`，也不会被提升。
+
+**系统通知**：状态变化时弹气泡通知——优化完成（含失败项数）、停止并还原、开关切换、
+快捷键注册失败。
 
 ## 8 项优化
 
-与原版逐项一致，白名单与硬性排除也照搬：
+白名单与硬性排除沿用原版：
 
 | id | 内容 | 需管理员 | 可还原 |
 |---|---|---|---|
-| `priority` | 游戏进程提到「高」，白名单后台进程降到「低于正常」 | 否 | 是 |
+| `priority` | 目标进程（`game_process`）提到「高」，白名单后台进程降到「低于正常」 | 否 | 是 |
 | `background` | 结束白名单内的后台进程 | 是 | 否 |
 | `memory` | 整理所有进程工作集（EmptyWorkingSet） | 否 | 否 |
 | `wallpaper` | 关闭 Wallpaper Engine | 否 | 是 |
@@ -100,7 +141,11 @@
 | `dns` | 刷新 DNS 解析缓存 | 否 | 否 |
 | `clipboard` | 清空剪贴板 | 否 | 否 |
 
-进程终止只允许命中 `BACKGROUND_WHITELIST`，另有 `PROTECTED_PROCESSES` 硬性排除；服务操作只允许 `SERVICE_WHITELIST` 内的两个。可还原项在执行前记录原状态，停止优化或游戏退出时还原。
+`priority` 的提升目标来自快捷键识别的前台进程（`game_process`）。没有目标时
+（还没按过快捷键、或前台是排除清单里的进程、或进程已退出）只做后台降级。
+命令行 `--optimize-once` 不经过快捷键，所以使用配置里上次记录的目标。
+
+进程终止只允许命中 `BACKGROUND_WHITELIST`，另有 `PROTECTED_PROCESSES` 硬性排除；服务操作只允许 `SERVICE_WHITELIST` 内的两个。可还原项在执行前记录原状态，停止优化时还原。
 
 `wallpaper` 在结束进程**之前**先记下它的可执行文件路径，还原时按该路径重新启动；
 若用户已经自己把 Wallpaper Engine 开回来了，则不会启动第二份。
@@ -117,15 +162,6 @@
   如实报「失败」而不是「已重新启动」
 - 连续两轮优化中间没有还原时，待还原的关闭记录会带进下一轮，不会被快照重置丢掉
 
-## 游戏识别
-
-沿用原版 v1.3.0 起的方案：以 **GPU 3D 引擎占用**为主判据
-（`\GPU Engine(*)\Utilization Percentage`，与任务管理器同源），
-辅以全屏状态、窗口尺寸、内存、线程、CPU、进程名特征与父子链加权评分，
-阈值 60 分。GPU 数据缺失时（纯 CPU 游戏、驱动未暴露计数器）由其他维度兜底。
-
-轮询间隔 3 秒；游戏退出后等待 6 秒才停止优化，避免切窗口导致反复启停。
-
 ## 命令行
 
 后台程序没有界面，排障靠这几个开关：
@@ -133,7 +169,6 @@
 ```bash
 wgopt                     # 启动托盘常驻（默认）
 wgopt --status            # 查看配置、权限、内存、各项开关
-wgopt --detect            # 执行一轮游戏识别并输出判定依据
 wgopt --optimize-once     # 执行一轮优化（不常驻）
 wgopt --restore           # 说明还原入口（快照只存在于运行中的进程）
 wgopt --version

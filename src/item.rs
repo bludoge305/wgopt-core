@@ -18,7 +18,7 @@ pub fn item_definitions() -> Vec<OptimizeItem> {
     vec![
         OptimizeItem {
             id: "priority".into(),
-            label: "调整会影响游戏的进程优先级".into(),
+            label: "提升游戏进程优先级".into(),
             needs_admin: false,
             reversible: true,
         },

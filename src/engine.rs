@@ -151,56 +151,55 @@ fn confirm_started(name: &str) -> bool {
 
 // ---------------------------------------------------------------- 各项优化
 
-/// 1. 调整进程优先级：游戏进程升到「高」，白名单后台进程降到「低于正常」。
-pub fn optimize_priority(target_game: Option<&str>, snapshot: &mut Snapshot) -> ItemResult {
+/// 1. 调整进程优先级：目标进程升到「高」，白名单后台进程降到「低于正常」。
+///
+/// `target` 是快捷键触发时识别出的前台进程名（已通过排除清单校验）。
+/// 同名进程可能不止一个，全部提升；命中保护名单或不在进程表里时跳过。
+pub fn optimize_priority(target: Option<&str>, snapshot: &mut Snapshot) -> ItemResult {
     let started = std::time::Instant::now();
     // 只需要 pid 与名称，用轻量枚举避免全量句柄查询的开销
-    let basic = winapi::list_processes_basic();
+    let processes = winapi::list_processes_basic();
 
     let mut promoted = 0usize;
     let mut demoted = 0usize;
 
-    for (pid, name) in &basic {
-        let lower = name.to_ascii_lowercase();
-        let pid = *pid;
-        if whitelist::is_protected(name) {
-            continue;
-        }
-
-        let is_game = match target_game {
-            Some(g) => lower == g.to_ascii_lowercase(),
-            None => whitelist::is_known_game(name),
-        };
-
-        if is_game {
-            // set_process_priority 内部会返回原优先级，无需事先查询
-            if let Ok(before) = winapi::set_process_priority(pid, "高") {
-                if before != "高" {
-                    snapshot.promoted.push((pid, name.clone()));
+    if let Some(game) = target {
+        for (pid, name) in &processes {
+            if !name.eq_ignore_ascii_case(game) {
+                continue;
+            }
+            if whitelist::is_protected(name) {
+                continue;
+            }
+            // set_process_priority 返回设置前的优先级
+            match winapi::set_process_priority(*pid, "高") {
+                Ok(before) if before != "高" => {
+                    snapshot.promoted.push((*pid, name.clone(), before));
                     promoted += 1;
                 }
-            }
-            continue;
-        }
-
-        if whitelist::in_background_whitelist(name) {
-            if let Ok(before) = winapi::set_process_priority(pid, "低于正常") {
-                if before != "低于正常" && before != "低" {
-                    snapshot.demoted.push((pid, name.clone(), before));
-                    demoted += 1;
-                }
+                _ => {}
             }
         }
     }
 
-    let detail = if promoted == 0 && demoted == 0 {
-        "未发现需要调整的进程".to_string()
-    } else if promoted == 0 {
-        format!("{demoted} 个后台进程已降级")
-    } else if demoted == 0 {
-        format!("{promoted} 个游戏进程已提升为高优先级")
-    } else {
-        format!("{promoted} 个游戏进程提升为高，{demoted} 个后台进程降级")
+    for (pid, name) in &processes {
+        if whitelist::is_protected(name) || !whitelist::in_background_whitelist(name) {
+            continue;
+        }
+        match winapi::set_process_priority(*pid, "低于正常") {
+            Ok(before) if before != "低于正常" && before != "低" => {
+                snapshot.demoted.push((*pid, name.clone(), before));
+                demoted += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let detail = match (promoted, demoted) {
+        (0, 0) => "未发现需要调整的进程".to_string(),
+        (0, d) => format!("{d} 个后台进程已降级"),
+        (p, 0) => format!("{p} 个进程已提升为高优先级"),
+        (p, d) => format!("{p} 个进程提升为高，{d} 个后台进程降级"),
     };
 
     ItemResult {
@@ -216,7 +215,7 @@ pub fn optimize_priority(target_game: Option<&str>, snapshot: &mut Snapshot) -> 
 /// 白名单里也包含 Wallpaper Engine。它一旦在这里被结束，还原时就再也
 /// 找不到它了（进程已消失，查不到路径），所以与第 4 项一样，在结束前
 /// 取路径登记进快照。
-pub fn optimize_background(game_name: Option<&str>, snapshot: &mut Snapshot) -> ItemResult {
+pub fn optimize_background(snapshot: &mut Snapshot) -> ItemResult {
     let started = std::time::Instant::now();
     let mut killed: Vec<String> = Vec::new();
     let mut denied: Vec<String> = Vec::new();
@@ -226,12 +225,6 @@ pub fn optimize_background(game_name: Option<&str>, snapshot: &mut Snapshot) -> 
     for (pid, name) in winapi::list_processes_basic() {
         if whitelist::is_protected(&name) {
             continue;
-        }
-        // 不结束游戏自身
-        if let Some(g) = game_name {
-            if name.eq_ignore_ascii_case(g) {
-                continue;
-            }
         }
         if !whitelist::in_background_whitelist(&name) {
             continue;
@@ -454,10 +447,10 @@ pub fn optimize_clipboard() -> ItemResult {
 // ---------------------------------------------------------------- 调度
 
 /// 按 id 执行单个优化项。
-pub fn run_item(id: &str, game: Option<&str>, snapshot: &mut Snapshot) -> ItemResult {
+pub fn run_item(id: &str, target: Option<&str>, snapshot: &mut Snapshot) -> ItemResult {
     match id {
-        "priority" => optimize_priority(game, snapshot),
-        "background" => optimize_background(game, snapshot),
+        "priority" => optimize_priority(target, snapshot),
+        "background" => optimize_background(snapshot),
         "memory" => optimize_memory(),
         "wallpaper" => optimize_wallpaper(snapshot),
         "xbox" => optimize_service("xbox", "XblAuthManager", "Xbox Live 身份验证管理器", snapshot),
@@ -474,9 +467,9 @@ pub fn run_item(id: &str, game: Option<&str>, snapshot: &mut Snapshot) -> ItemRe
 }
 
 /// 按给定顺序逐项执行优化。
-pub fn run_items(ids: &[String], game: Option<&str>, snapshot: &mut Snapshot) -> Vec<ItemResult> {
+pub fn run_items(ids: &[String], target: Option<&str>, snapshot: &mut Snapshot) -> Vec<ItemResult> {
     ids.iter()
-        .map(|id| run_item(id, game, snapshot))
+        .map(|id| run_item(id, target, snapshot))
         .collect()
 }
 
@@ -484,14 +477,21 @@ pub fn run_items(ids: &[String], game: Option<&str>, snapshot: &mut Snapshot) ->
 pub fn restore(snapshot: &Snapshot) -> Vec<String> {
     let mut messages = Vec::new();
 
-    for (pid, name, original) in &snapshot.demoted {
-        if winapi::set_process_priority(*pid, original).is_ok() {
-            messages.push(format!("已恢复 {name} 优先级为{original}"));
+    // 进程可能在优化期间已经退出（游戏关掉是常态），此时 OpenProcess
+    // 会失败。这不是错误，但不能一声不响——否则用户只看到"已还原"
+    // 却不知道有一项没恢复。
+    for (pid, name, original) in &snapshot.promoted {
+        match winapi::set_process_priority(*pid, original) {
+            Ok(_) => messages.push(format!("已恢复 {name} 优先级为{original}")),
+            Err(e) => messages.push(format!("恢复 {name} 优先级失败：{e}")),
         }
     }
 
-    for (_pid, name) in &snapshot.promoted {
-        messages.push(format!("已取消 {name} 的高优先级"));
+    for (pid, name, original) in &snapshot.demoted {
+        match winapi::set_process_priority(*pid, original) {
+            Ok(_) => messages.push(format!("已恢复 {name} 优先级为{original}")),
+            Err(e) => messages.push(format!("恢复 {name} 优先级失败：{e}")),
+        }
     }
 
     for service in &snapshot.stopped_services {

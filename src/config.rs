@@ -18,15 +18,13 @@ pub const FILE_NAME: &str = "config.json";
 pub struct Config {
     /// 优化总开关。关闭时后台常驻但不做任何优化，托盘菜单可切换。
     pub enabled: bool,
-    /// "游戏运行时自动进行游戏优化"
-    pub auto_optimize: bool,
     /// 各优化项的勾选状态，key 为 item id
     pub enabled_items: Vec<String>,
     /// 开机自启
     pub autostart: bool,
     /// 开始优化时弹出系统通知
     pub notify_on_start: bool,
-    /// 游戏退出、自动恢复时弹出系统通知
+    /// 停止优化并还原时弹出系统通知
     pub notify_on_stop: bool,
     /// 程序退出时还原可还原项（进程优先级、服务、被关闭的 Wallpaper Engine）
     pub restore_on_exit: bool,
@@ -34,6 +32,14 @@ pub struct Config {
     pub hotkey_enabled: bool,
     /// 「立即开始优化」的全局快捷键，如 `Ctrl+F2`
     pub hotkey: String,
+    /// 最近一次按快捷键时自动识别到的前台进程名（如 `game.exe`）。
+    ///
+    /// 快捷键触发时写入，之后的优化轮次优先使用它。为空表示还没识别过。
+    pub game_process: String,
+    /// 绝不允许提升优先级的进程名清单（小写、含 `.exe`）。
+    ///
+    /// 即使某个进程此刻是前台窗口，命中这里也不会被提升。
+    pub excluded_processes: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -48,11 +54,95 @@ fn default_hotkey() -> String {
     crate::hotkey::DEFAULT_HOTKEY.to_string()
 }
 
+/// 默认排除清单：这些进程即使占据前台窗口也绝不提升优先级。
+///
+/// 覆盖三类必须排除的情况：
+/// 1. 系统外壳与关键服务——给它们提高优先级会拖慢或卡死整个系统
+/// 2. 浏览器与常见桌面程序——用户在看网页/聊天时按快捷键不该把它们提权
+/// 3. 本程序自身
+pub fn default_excluded_processes() -> Vec<String> {
+    [
+        // 系统外壳与关键进程
+        "explorer.exe",
+        "dwm.exe",
+        "csrss.exe",
+        "wininit.exe",
+        "winlogon.exe",
+        "services.exe",
+        "lsass.exe",
+        "smss.exe",
+        "svchost.exe",
+        "taskhostw.exe",
+        "sihost.exe",
+        "ctfmon.exe",
+        "runtimebroker.exe",
+        "fontdrvhost.exe",
+        "audiodg.exe",
+        "searchhost.exe",
+        "startmenuexperiencehost.exe",
+        "shellexperiencehost.exe",
+        "applicationframehost.exe",
+        "textinputhost.exe",
+        "lockapp.exe",
+        // 浏览器
+        "chrome.exe",
+        "msedge.exe",
+        "firefox.exe",
+        "brave.exe",
+        "opera.exe",
+        "vivaldi.exe",
+        "iexplore.exe",
+        "chromium.exe",
+        "zen.exe",
+        // 开发与终端
+        "code.exe",
+        "devenv.exe",
+        "pycharm64.exe",
+        "idea64.exe",
+        "windowsterminal.exe",
+        "conhost.exe",
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "wsl.exe",
+        "wslhost.exe",
+        // 通讯与办公
+        "wechat.exe",
+        "weixin.exe",
+        "qq.exe",
+        "dingtalk.exe",
+        "feishu.exe",
+        "lark.exe",
+        "teams.exe",
+        "slack.exe",
+        "discord.exe",
+        "telegram.exe",
+        "winword.exe",
+        "excel.exe",
+        "powerpnt.exe",
+        "wps.exe",
+        "notion.exe",
+        "obsidian.exe",
+        "typora.exe",
+        // 媒体
+        "vlc.exe",
+        "potplayermini64.exe",
+        "mpc-hc64.exe",
+        "wmplayer.exe",
+        "obs64.exe",
+        "obs32.exe",
+        // 本程序
+        "wgopt.exe",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: true,
-            auto_optimize: true,
             enabled_items: default_enabled_items(),
             autostart: false,
             notify_on_start: default_true(),
@@ -60,6 +150,8 @@ impl Default for Config {
             restore_on_exit: default_true(),
             hotkey_enabled: true,
             hotkey: default_hotkey(),
+            game_process: String::new(),
+            excluded_processes: default_excluded_processes(),
         }
     }
 }
@@ -74,6 +166,26 @@ impl Config {
         if self.enabled_items.is_empty() {
             self.enabled_items = known;
         }
+
+        // 排除清单统一小写去重：匹配一律不走大小写敏感路径
+        self.excluded_processes
+            .retain(|n| !n.trim().is_empty());
+        for n in &mut self.excluded_processes {
+            *n = n.trim().to_ascii_lowercase();
+        }
+        self.excluded_processes.sort();
+        self.excluded_processes.dedup();
+
+        // 记住的进程名不要带路径，只留文件名
+        self.game_process = file_name(&self.game_process);
+    }
+
+    /// 某个进程是否在排除清单里（大小写不敏感）。
+    ///
+    /// 命中这里的进程即使此刻占据前台窗口也不会被提升优先级。
+    pub fn is_excluded(&self, name: &str) -> bool {
+        let lower = name.trim().to_ascii_lowercase();
+        self.excluded_processes.contains(&lower)
     }
 
     /// 某项是否启用。
@@ -107,6 +219,18 @@ impl Config {
         }
         crate::hotkey::Hotkey::parse(&self.hotkey).map(Some)
     }
+}
+
+/// 取路径中的文件名；空串或纯路径保持为空。
+fn file_name(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    std::path::Path::new(trimmed)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| trimmed.to_string())
 }
 
 /// 配置目录：`%APPDATA%\WGOpt`，与原版 Tauri 的 app_config_dir 一致，
@@ -324,7 +448,8 @@ mod tests {
         let dir = std::env::temp_dir().join("wgopt-test-missing");
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = load_from_dir(&dir);
-        assert!(cfg.enabled && cfg.auto_optimize);
+        assert!(cfg.enabled);
+        assert_eq!(cfg.enabled_items.len(), item::item_definitions().len());
     }
 
     #[test]
@@ -416,5 +541,57 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.active_hotkey().unwrap().unwrap().to_string(), "Alt+Shift+F9");
+    }
+
+    /// 默认排除清单必须覆盖解释器类系统进程，否则按快捷键会把它们提权。
+    #[test]
+    fn default_exclusions_cover_shell_and_browsers() {
+        let cfg = Config::default();
+        assert!(!cfg.excluded_processes.is_empty());
+        for name in ["explorer.exe", "chrome.exe", "dwm.exe", "wgopt.exe"] {
+            assert!(cfg.is_excluded(name), "{name} 应在默认排除清单里");
+        }
+        // 常见游戏不在排除清单里，否则识别机制就没法工作
+        assert!(!cfg.is_excluded("blackmythwukong.exe"));
+    }
+
+    /// 归一化把排除清单统一成小写并去重，匹配时不区分用户写法。
+    #[test]
+    fn normalize_lowercases_and_dedups_exclusions() {
+        let mut cfg = Config {
+            excluded_processes: vec!["Chrome.EXE".into(), " chrome.exe ".into(), "".into()],
+            ..Default::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.excluded_processes, vec!["chrome.exe".to_string()]);
+        assert!(cfg.is_excluded("CHROME.EXE"));
+    }
+
+    /// game_process 只保留文件名，手工写成路径也不会带进去。
+    #[test]
+    fn normalize_strips_path_from_game_process() {
+        let mut cfg = Config {
+            game_process: r"D:\Games\Foo\game.exe".into(),
+            ..Default::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.game_process, "game.exe");
+    }
+
+    /// 旧配置没有新字段时按默认补齐，且能正常读取。
+    #[test]
+    fn old_config_without_new_fields_gets_defaults() {
+        let dir = std::env::temp_dir().join("wgopt-test-new-fields");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(FILE_NAME), r#"{"enabled":true}"#).unwrap();
+
+        let cfg = load_from_dir(&dir);
+        assert!(cfg.enabled);
+        assert!(cfg.game_process.is_empty());
+        assert!(!cfg.excluded_processes.is_empty(), "缺省应补上默认排除清单");
+        assert!(cfg.is_excluded("chrome.exe"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

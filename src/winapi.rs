@@ -3,19 +3,16 @@
 //! 原样沿用 WGOpt 桌面版的实现，只去掉界面需要的展示字段。
 //! 所有对外函数返回 `Result<_, String>`，错误信息为可直接展示的中文。
 
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
-use windows::Win32::System::ProcessStatus::{
-    EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-};
+use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
 use windows::Win32::System::Services::{
     CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx,
     StartServiceW, SC_HANDLE, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS,
@@ -24,10 +21,11 @@ use windows::Win32::System::Services::{
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, GetPriorityClass, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_INFORMATION,
     SetPriorityClass, TerminateProcess, ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS,
-    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, PROCESS_VM_READ,
-    REALTIME_PRIORITY_CLASS,
+    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA,
+    PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
 };
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 
@@ -95,20 +93,6 @@ pub fn is_elevated() -> bool {
 
 // ---------------------------------------------------------------- 进程枚举
 
-#[derive(Debug, Clone)]
-pub struct ProcessInfo {
-    pub pid: u32,
-    pub name: String,
-    /// 工作集占用（字节）
-    pub working_set: u64,
-    /// 线程数量
-    pub thread_count: u32,
-    /// 句柄数量
-    pub handle_count: u32,
-    /// 父进程名称（父进程已退出时为空）
-    pub parent_name: Option<String>,
-}
-
 /// 进程优先级类常量 → 名称
 pub fn priority_name(class: u32) -> &'static str {
     match class {
@@ -135,52 +119,12 @@ pub fn priority_class(name: &str) -> Option<windows::Win32::System::Threading::P
     })
 }
 
-/// 所有进程的 (pid, 父 pid) 映射，用于构建父子链。
-pub fn process_parents() -> Vec<(u32, u32)> {
-    process_snapshot_raw()
-        .into_iter()
-        .map(|(pid, ppid, _)| (pid, ppid))
-        .collect()
-}
-
 /// 轻量版进程列表：只取 pid 与名称，不做句柄/内存查询。
-/// 用于高频轮询与批量结束进程，避免反复打开每个进程的句柄。
+/// 批量结束进程、调整优先级只需要这两项。
 pub fn list_processes_basic() -> Vec<(u32, String)> {
     process_snapshot_raw()
         .into_iter()
         .map(|(pid, _, name)| (pid, name))
-        .collect()
-}
-
-/// 枚举指定进程的详细信息（工作集、线程数、句柄数、父进程名）。
-///
-/// 只查调用方给的少量候选：每个 pid 都要开句柄、读内存计数，
-/// 全量枚举没有调用者，也不需要。
-pub fn list_processes_subset_with_threads(
-    pids: &[u32],
-    thread_map: &[(u32, u32)],
-) -> Vec<ProcessInfo> {
-    if pids.is_empty() {
-        return Vec::new();
-    }
-    let raw = process_snapshot_raw();
-    let names: HashMap<u32, String> = raw.iter().map(|(p, _, n)| (*p, n.clone())).collect();
-    let parents: HashMap<u32, u32> = raw.iter().map(|(p, pp, _)| (*p, *pp)).collect();
-    let threads: HashMap<u32, u32> = thread_map.iter().copied().collect();
-
-    pids.iter()
-        .filter_map(|pid| {
-            let name = names.get(pid)?.clone();
-            let (working_set, handle_count) = process_stats(*pid);
-            Some(ProcessInfo {
-                pid: *pid,
-                name,
-                working_set,
-                thread_count: threads.get(pid).copied().unwrap_or(0),
-                handle_count,
-                parent_name: parents.get(pid).and_then(|pp| names.get(pp)).cloned(),
-            })
-        })
         .collect()
 }
 
@@ -212,110 +156,34 @@ fn process_snapshot_raw() -> Vec<(u32, u32, String)> {
     raw
 }
 
-/// 一次打开句柄，同时取工作集与句柄数。
-///
-/// 带反作弊保护的游戏进程常会拒绝 `PROCESS_VM_READ`，此时退回
-/// `PROCESS_QUERY_LIMITED_INFORMATION`——工作集与句柄数依然可读，
-/// 只有更细的内存细节拿不到。这样能避免把游戏误判成"零内存"进程。
-fn process_stats(pid: u32) -> (u64, u32) {
-    use windows::Win32::System::Threading::GetProcessHandleCount;
-
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid)
-            .or_else(|_| OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid))
-            .ok();
-
-        let Some(handle) = handle else {
-            return (0, 0);
-        };
-
-        let mut counters = PROCESS_MEMORY_COUNTERS::default();
-        let ok = K32GetProcessMemoryInfo(
-            handle,
-            &mut counters,
-            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        )
-        .as_bool();
-        let working_set = if ok { counters.WorkingSetSize as u64 } else { 0 };
-
-        let mut handles = 0u32;
-        let _ = GetProcessHandleCount(handle, &mut handles);
-
-        let _ = CloseHandle(handle);
-        (working_set, handles)
-    }
-}
-
-/// 一次遍历线程快照，统计所有进程的线程数。
-///
-/// 逐进程查询会为每个进程重建全系统快照（O(n²)），进程多时开销明显，
-/// 因此改为一次性统计。
-pub fn all_thread_counts() -> Vec<(u32, u32)> {
-    use std::collections::HashMap;
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
-    let mut counts: HashMap<u32, u32> = HashMap::new();
-    unsafe {
-        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) else {
-            return Vec::new();
-        };
-        let mut entry = THREADENTRY32 {
-            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-            ..Default::default()
-        };
-        if Thread32First(snapshot, &mut entry).is_ok() {
-            loop {
-                *counts.entry(entry.th32OwnerProcessID).or_insert(0) += 1;
-                if Thread32Next(snapshot, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = CloseHandle(snapshot);
-    }
-    counts.into_iter().collect()
-}
-
-/// 进程累计 CPU 时间（毫秒），失败返回 None。
-pub fn process_cpu_time_ms(pid: u32) -> Option<u64> {
-    use windows::Win32::Foundation::FILETIME;
-    use windows::Win32::System::Threading::GetProcessTimes;
-
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut creation = FILETIME::default();
-        let mut exit = FILETIME::default();
-        let mut kernel_t = FILETIME::default();
-        let mut user_t = FILETIME::default();
-        let ok =
-            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel_t, &mut user_t).is_ok();
-        let _ = CloseHandle(handle);
-        if !ok {
-            return None;
-        }
-        Some(filetime_to_ms(&kernel_t) + filetime_to_ms(&user_t))
-    }
-}
-
-fn filetime_to_ms(ft: &windows::Win32::Foundation::FILETIME) -> u64 {
-    ((ft.dwHighDateTime as u64) << 32 | ft.dwLowDateTime as u64) / 10_000
-}
-
 /// 设置进程优先级，返回设置前的优先级名。
+///
+/// 句柄同时申请 `PROCESS_SET_INFORMATION` 与 `PROCESS_QUERY_INFORMATION`：
+/// 只有前者时 `GetPriorityClass` 会失败并返回 0，原来记录的「原优先级」
+/// 就永远是「未知」，还原时又因「未知」不是合法等级而静默失败。
 pub fn set_process_priority(pid: u32, level: &str) -> Result<String, String> {
     let Some(class) = priority_class(level) else {
         return Err(format!("未知的优先级：{level}"));
     };
     unsafe {
-        let handle = OpenProcess(PROCESS_SET_INFORMATION, false, pid).map_err(|e| {
+        let access = PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION;
+        let handle = OpenProcess(access, false, pid).map_err(|e| {
             format!("无法打开进程 {pid}（错误码 {}），可能需要管理员权限", e.code().0)
         })?;
-        let before = priority_name(GetPriorityClass(handle)).to_string();
+        let before_raw = GetPriorityClass(handle);
+        let before = priority_name(before_raw);
+        if before_raw == 0 {
+            let code = GetLastError();
+            let _ = CloseHandle(handle);
+            return Err(format!(
+                "读取进程 {pid} 当前优先级失败（错误码 0x{:08X}）",
+                code.0
+            ));
+        }
         let res = SetPriorityClass(handle, class);
         let _ = CloseHandle(handle);
         res.map_err(|e| format!("设置优先级失败（错误码 {}）", e.code().0))?;
-        Ok(before)
+        Ok(before.to_string())
     }
 }
 
@@ -333,6 +201,43 @@ pub fn terminate_process(pid: u32) -> Result<(), String> {
 /// 当前进程 ID。
 pub fn current_pid() -> u32 {
     unsafe { GetCurrentProcessId() }
+}
+
+/// 前台窗口所属进程：(pid, 进程名)。拿不到时返回 `None`。
+///
+/// 用于快捷键触发时确认「用户此刻在玩哪个程序」。`GetForegroundWindow`
+/// 返回无效句柄（桌面、锁屏、切换中）或窗口不属于任何进程时返回 `None`。
+pub fn foreground_process() -> Option<(u32, String)> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+        let name = process_name(pid);
+        if name.is_empty() {
+            return None;
+        }
+        Some((pid, name))
+    }
+}
+
+/// 取进程名（不含路径）。取不到时返回空串。
+pub fn process_name(pid: u32) -> String {
+    let path = process_image_path(pid);
+    if path.is_empty() {
+        return String::new();
+    }
+    std::path::Path::new(&path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// 取进程可执行文件完整路径，取不到时返回空串。
